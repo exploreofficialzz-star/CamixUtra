@@ -1,240 +1,349 @@
 package com.chastechgroup.camix.camera
 
-import android.content.ContentValues
 import android.content.Context
-import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CameraManager
 import android.net.Uri
-import android.os.Build
-import android.os.Environment
-import android.provider.MediaStore
 import android.util.Size
-import android.view.Surface
-import androidx.camera.core.*
+import androidx.camera.core.AspectRatio
+import androidx.camera.core.Camera
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.FocusMeteringAction
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.Preview
+import androidx.camera.core.SurfaceOrientedMeteringPointFactory
 import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.video.*
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
+import com.chastechgroup.camix.audio.AudioProcessor
 import com.chastechgroup.camix.filter.FilterParameters
-import com.chastechgroup.camix.filter.FilterRenderer
 import com.chastechgroup.camix.filter.SceneDetector
 import com.chastechgroup.camix.filter.SceneType
-import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.*
+import com.chastechgroup.camix.gl.CameraGlPipeline
+import com.chastechgroup.camix.gl.StillRenderer
+import com.chastechgroup.camix.pulse.PulseEngine
+import com.chastechgroup.camix.record.VideoRecorder
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import timber.log.Timber
-import java.io.OutputStream
-import java.util.concurrent.ExecutorService
+import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
-class UltraCameraManager(private val context: Context) {
+/**
+ * Orchestrates everything that touches the camera:
+ *
+ *  CameraX (Preview + ImageCapture + ImageAnalysis)
+ *     Preview ───► CameraGlPipeline (look + Pulse FX) ───► viewfinder  +  VideoRecorder (MP4)
+ *     ImageCapture ► StillRenderer (same look, full resolution) ► gallery
+ *     ImageAnalysis ► SceneDetector ► AI-Auto look + AutoExposureController
+ *  AudioProcessor ─► PulseEngine (visuals)  and  VideoRecorder (processed audio track)
+ *
+ * If the GPU path cannot start on a device, [glFailed] flips and the UI supplies a plain CameraX
+ * PreviewView provider instead (photos still work; live FX and recording are disabled).
+ */
+class UltraCameraManager(
+    private val context: Context,
+    val audio: AudioProcessor,
+    val pulse: PulseEngine
+) : CameraGlPipeline.Listener {
 
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
-    private val cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val mainExecutor = ContextCompat.getMainExecutor(context)
+    private val analysisExecutor = Executors.newSingleThreadExecutor()
 
+    val glPipeline = CameraGlPipeline(this)
+    val sceneDetector = SceneDetector()
+    val autoExposure = AutoExposureController()
+    private val stillRenderer = StillRenderer()
+
+    // ── CameraX objects ───────────────────────────────────────────────────────
     private var cameraProvider: ProcessCameraProvider? = null
     private var camera: Camera? = null
     private var preview: Preview? = null
     private var imageCapture: ImageCapture? = null
-    private var videoCapture: VideoCapture<Recorder>? = null
-    private var imageAnalysis: ImageAnalysis? = null
-    private var recording: Recording? = null
-
-    val sceneDetector       = SceneDetector()
-    val autoExposure        = AutoExposureController()
-    val enhancementPipeline = ImageEnhancementPipeline(context)
-    val computationalEngine = ComputationalPhotoEngine(context)
-
-    private var previewWidth  = 1080f
-    private var previewHeight = 1920f
+    private var lensFacing = CameraSelector.LENS_FACING_BACK
+    private var boundOwner: LifecycleOwner? = null
+    private var fallbackProvider: Preview.SurfaceProvider? = null
+    private var analysisAvailable = true
 
     // ── State ─────────────────────────────────────────────────────────────────
-    private val _cameraState       = MutableStateFlow(CamState.IDLE)
+    private val _cameraState = MutableStateFlow(CamState.IDLE)
     val cameraState: StateFlow<CamState> = _cameraState.asStateFlow()
 
-    private val _detectedScene     = MutableStateFlow(SceneType.AUTO)
+    private val _detectedScene = MutableStateFlow(SceneType.AUTO)
     val detectedScene: StateFlow<SceneType> = _detectedScene.asStateFlow()
 
-    private val _filterParams      = MutableStateFlow(FilterParameters.DEFAULT)
+    private val _filterParams = MutableStateFlow(FilterParameters.DEFAULT)
     val filterParams: StateFlow<FilterParameters> = _filterParams.asStateFlow()
 
-    private val _flashMode         = MutableStateFlow(FlashMode.OFF)
+    private val _flashMode = MutableStateFlow(FlashMode.OFF)
     val flashMode: StateFlow<FlashMode> = _flashMode.asStateFlow()
 
-    private val _isRecording       = MutableStateFlow(false)
+    private val _isRecording = MutableStateFlow(false)
     val isRecording: StateFlow<Boolean> = _isRecording.asStateFlow()
 
-    private val _zoomLevel         = MutableStateFlow(1f)
+    private val _recordingSeconds = MutableStateFlow(0)
+    val recordingSeconds: StateFlow<Int> = _recordingSeconds.asStateFlow()
+
+    private val _zoomLevel = MutableStateFlow(1f)
     val zoomLevel: StateFlow<Float> = _zoomLevel.asStateFlow()
 
-    private val _aeAfLocked        = MutableStateFlow(false)
+    private val _aeAfLocked = MutableStateFlow(false)
     val aeAfLocked: StateFlow<Boolean> = _aeAfLocked.asStateFlow()
 
-    private val _isTimelapse       = MutableStateFlow(false)
+    private val _isTimelapse = MutableStateFlow(false)
     val isTimelapse: StateFlow<Boolean> = _isTimelapse.asStateFlow()
 
     private val _timelapseCaptured = MutableStateFlow(0)
     val timelapseCaptured: StateFlow<Int> = _timelapseCaptured.asStateFlow()
 
-    private val _exposureLabel     = MutableStateFlow("Auto")
+    private val _exposureLabel = MutableStateFlow("Auto")
     val exposureLabel: StateFlow<String> = _exposureLabel.asStateFlow()
 
-    private val _isClipping        = MutableStateFlow(false)
+    private val _isClipping = MutableStateFlow(false)
     val isClipping: StateFlow<Boolean> = _isClipping.asStateFlow()
 
-    private val _processingStatus  = MutableStateFlow("")
+    private val _processingStatus = MutableStateFlow("")
     val processingStatus: StateFlow<String> = _processingStatus.asStateFlow()
 
-    private val _isProcessing      = MutableStateFlow(false)
+    private val _isProcessing = MutableStateFlow(false)
     val isProcessing: StateFlow<Boolean> = _isProcessing.asStateFlow()
 
-    // ── Settings ──────────────────────────────────────────────────────────────
-    private var lensFacing           = CameraSelector.LENS_FACING_BACK
-    private var isAutoEnhanceEnabled = true
-    private var filterRenderer: FilterRenderer? = null
-    private var timelapseJob: Job? = null
+    private val _glFailed = MutableStateFlow(false)
+    /** true => the GPU path is unavailable; the UI must supply a plain PreviewView provider. */
+    val glFailed: StateFlow<Boolean> = _glFailed.asStateFlow()
 
-    // ── Init ──────────────────────────────────────────────────────────────────
+    private val _glMessage = MutableStateFlow<String?>(null)
+    val glMessage: StateFlow<String?> = _glMessage.asStateFlow()
+
+    private val _isFront = MutableStateFlow(false)
+    val isFront: StateFlow<Boolean> = _isFront.asStateFlow()
+
+    private var isAutoEnhanceEnabled = true
+    private var recorder: VideoRecorder? = null
+    private var timelapseRecorder: VideoRecorder? = null
+    private var timelapseJob: Job? = null
+    private var timerJob: Job? = null
+
     init {
+        pulse.enabled = false
+        glPipeline.pulseSource = pulse
+        audio.featureListener = { f -> pulse.onFeatures(f) }
+
         scope.launch {
             sceneDetector.suggestedParams.collect { params ->
-                if (isAutoEnhanceEnabled) {
-                    _filterParams.value = params
-                    filterRenderer?.updateParameters(params)
-                }
+                if (isAutoEnhanceEnabled) applyLook(params)
             }
         }
-        scope.launch {
-            sceneDetector.detectedScene.collect { scene ->
-                _detectedScene.value = scene
-                enhancementPipeline.applyScenePreset(scene.name)
-                computationalEngine.isNightMode =
-                    scene == SceneType.NIGHT || scene == SceneType.LOW_LIGHT
-                computationalEngine.isPortraitMode = scene == SceneType.PORTRAIT
-            }
-        }
+        scope.launch { sceneDetector.detectedScene.collect { _detectedScene.value = it } }
         scope.launch { autoExposure.exposureLabel.collect { _exposureLabel.value = it } }
-        scope.launch { autoExposure.isClipping.collect   { _isClipping.value    = it } }
+        scope.launch { autoExposure.isClipping.collect { _isClipping.value = it } }
         scope.launch {
             sceneDetector.sceneStats.collect { stats ->
                 if (stats != null) {
+                    val scene = _detectedScene.value
                     autoExposure.updateScene(
-                        brightness  = stats.avgBrightness,
-                        darkRatio   = stats.darkRatio,
+                        brightness = stats.avgBrightness,
+                        darkRatio = stats.darkRatio,
                         brightRatio = stats.brightRatio,
-                        skinRatio   = stats.skinRatio,
-                        hfEnergy    = stats.hfEnergyRatio,
-                        isNight     = _detectedScene.value == SceneType.NIGHT ||
-                                      _detectedScene.value == SceneType.LOW_LIGHT,
-                        isBacklit   = _detectedScene.value == SceneType.BACKLIT
+                        skinRatio = stats.skinRatio,
+                        hfEnergy = stats.hfEnergyRatio,
+                        isNight = scene == SceneType.NIGHT || scene == SceneType.LOW_LIGHT,
+                        isBacklit = scene == SceneType.BACKLIT
                     )
-                    computationalEngine.ambientLux =
-                        (stats.avgBrightness * 10f).toFloat().coerceIn(1f, 10000f)
                 }
             }
         }
     }
 
-    // ── Camera lifecycle ──────────────────────────────────────────────────────
-    fun startCamera(
-        lifecycleOwner:  LifecycleOwner,
-        surfaceProvider: Preview.SurfaceProvider,
-        onError: (Exception) -> Unit
-    ) {
-        ProcessCameraProvider.getInstance(context).also { future ->
-            future.addListener({
-                try {
-                    cameraProvider = future.get()
-                    bindUseCases(lifecycleOwner, surfaceProvider)
-                } catch (e: Exception) { Timber.e(e); onError(e) }
-            }, ContextCompat.getMainExecutor(context))
+    // ══════════════════════════════════════════════════════════════════════════
+    // GPU pipeline callbacks (posted to the main thread by the pipeline)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    override fun onGlFatal(message: String) {
+        Timber.e("GPU pipeline unavailable: %s", message)
+        if (_isRecording.value) stopRecording({ }, { })
+        if (_isTimelapse.value) stopTimelapse({ }, { })
+        _glMessage.value = message
+        _glFailed.value = true
+        // rebind with the plain preview as soon as the UI provides a provider
+        val owner = boundOwner
+        if (owner != null && fallbackProvider != null) bind(owner, null)
+    }
+
+    override fun onFirstFrame() {
+        Timber.d("First GPU frame rendered")
+    }
+
+    /** Camera -> GPU pipeline. */
+    private val glSurfaceProvider = Preview.SurfaceProvider { request ->
+        val res = request.resolution
+        val front = lensFacing == CameraSelector.LENS_FACING_FRONT
+        request.setTransformationInfoListener(mainExecutor) { info ->
+            glPipeline.updateTransform(info.rotationDegrees, front)
+        }
+        glPipeline.createCameraSurface(res.width, res.height) { surface ->
+            if (surface == null) {
+                request.willNotProvideSurface()
+            } else {
+                request.provideSurface(surface, mainExecutor) { _ -> glPipeline.releaseCameraSurface(surface) }
+            }
         }
     }
 
-    private fun bindUseCases(owner: LifecycleOwner, surfaceProvider: Preview.SurfaceProvider) {
+    // ══════════════════════════════════════════════════════════════════════════
+    // Camera lifecycle
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @param fallback plain-preview provider (PreviewView), used only when the GPU path failed
+     */
+    fun startCamera(
+        lifecycleOwner: LifecycleOwner,
+        fallback: Preview.SurfaceProvider?,
+        onError: (String) -> Unit
+    ) {
+        boundOwner = lifecycleOwner
+        fallbackProvider = fallback
+        val future = ProcessCameraProvider.getInstance(context)
+        future.addListener({
+            try {
+                cameraProvider = future.get()
+                bind(lifecycleOwner, onError)
+            } catch (e: Exception) {
+                Timber.e(e, "Camera provider failed")
+                _cameraState.value = CamState.ERROR
+                onError("Camera init failed: " + e.message)
+            }
+        }, mainExecutor)
+    }
+
+    fun switchCamera(lifecycleOwner: LifecycleOwner, onError: (String) -> Unit) {
+        if (_isRecording.value || _isTimelapse.value) return
         val provider = cameraProvider ?: return
-        provider.unbindAll()
+        val target = if (lensFacing == CameraSelector.LENS_FACING_BACK)
+            CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
+        val selector = CameraSelector.Builder().requireLensFacing(target).build()
+        if (!provider.hasCamera(selector)) {
+            onError("No ${if (target == CameraSelector.LENS_FACING_FRONT) "front" else "back"} camera found")
+            return
+        }
+        lensFacing = target
+        _isFront.value = target == CameraSelector.LENS_FACING_FRONT
+        _zoomLevel.value = 1f
+        boundOwner = lifecycleOwner
+        bind(lifecycleOwner, onError)
+    }
+
+    private fun bind(owner: LifecycleOwner, onError: ((String) -> Unit)?) {
+        val provider = cameraProvider ?: return
+        val surfaceProvider: Preview.SurfaceProvider? =
+            if (_glFailed.value) fallbackProvider else glSurfaceProvider
+        if (surfaceProvider == null) {
+            Timber.w("bind(): waiting for a fallback preview provider")
+            return
+        }
+
         autoExposure.detach()
+        provider.unbindAll()
+        camera = null
 
         val selector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
 
-        preview = Preview.Builder()
-            .setTargetAspectRatio(AspectRatio.RATIO_16_9)
-            .setTargetRotation(Surface.ROTATION_0)
-            .build().also { it.setSurfaceProvider(surfaceProvider) }
+        val pv = Preview.Builder().setTargetAspectRatio(AspectRatio.RATIO_16_9).build()
+        pv.setSurfaceProvider(mainExecutor, surfaceProvider)
 
-        imageCapture = ImageCapture.Builder()
+        val ic = ImageCapture.Builder()
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+            .setTargetAspectRatio(AspectRatio.RATIO_16_9)
             .setFlashMode(_flashMode.value.toCX())
-            .setJpegQuality(97)
+            .setJpegQuality(95)
             .build()
 
-        // FIX: use setQualitySelector instead of setQuality
-        val recorder = Recorder.Builder()
-            .setQualitySelector(QualitySelector.from(Quality.HIGHEST))
-            .setExecutor(cameraExecutor)
+        var ia: ImageAnalysis? = ImageAnalysis.Builder()
+            .setTargetResolution(Size(640, 480))
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
             .build()
-        videoCapture = VideoCapture.withOutput(recorder)
-
-        if (lensFacing == CameraSelector.LENS_FACING_BACK) {
-            imageAnalysis = ImageAnalysis.Builder()
-                .setTargetResolution(Size(640, 480))
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                .build().also { ia ->
-                    ia.setAnalyzer(cameraExecutor) { proxy -> sceneDetector.processFrame(proxy) }
-                }
-        }
+        ia?.setAnalyzer(analysisExecutor) { proxy -> sceneDetector.processFrame(proxy) }
 
         try {
-            val useCases = buildList {
-                add(preview!!)
-                add(imageCapture!!)
-                add(videoCapture!!)
-                imageAnalysis?.let { add(it) }
+            val cam = try {
+                provider.bindToLifecycle(owner, selector, pv, ic, ia!!)
+            } catch (e: Exception) {
+                // 3 simultaneous streams are not supported on every device: drop scene analysis, keep the rest
+                Timber.w(e, "Preview+Capture+Analysis not supported - retrying without analysis")
+                ia?.clearAnalyzer()
+                ia = null
+                analysisAvailable = false
+                provider.unbindAll()
+                provider.bindToLifecycle(owner, selector, pv, ic)
             }
-            camera = provider.bindToLifecycle(owner, selector, *useCases.toTypedArray())
-            camera?.cameraControl?.setZoomRatio(1f)
-            camera?.let { autoExposure.attach(it) }
+            sceneDetector.enabled = ia != null
+            camera = cam
+            preview = pv
+            imageCapture = ic
+            autoExposure.attach(cam)
             _cameraState.value = CamState.READY
-            Timber.d("Camera bound — ${useCases.size} use-cases")
+            _isFront.value = lensFacing == CameraSelector.LENS_FACING_FRONT
+            applyTorch()
+            Timber.d("Camera bound (lens=%d, gl=%b, analysis=%b)", lensFacing, !_glFailed.value, ia != null)
         } catch (e: Exception) {
-            Timber.e(e, "bindUseCases failed")
+            Timber.e(e, "bindToLifecycle failed")
             _cameraState.value = CamState.ERROR
+            onError?.invoke("Camera bind failed: " + e.message)
         }
     }
 
-    fun setPreviewSize(w: Float, h: Float) {
-        previewWidth  = w.coerceAtLeast(1f)
-        previewHeight = h.coerceAtLeast(1f)
-    }
+    // ══════════════════════════════════════════════════════════════════════════
+    // Zoom / focus / exposure / flash
+    // ══════════════════════════════════════════════════════════════════════════
 
-    // ── Zoom ─────────────────────────────────────────────────────────────────
     fun setZoom(zoom: Float) {
         val z = zoom.coerceIn(1f, getMaxZoom())
         _zoomLevel.value = z
         camera?.cameraControl?.setZoomRatio(z)
     }
-    fun pinchZoom(scale: Float) = setZoom(_zoomLevel.value * scale)
-    fun getMaxZoom() = camera?.cameraInfo?.zoomState?.value?.maxZoomRatio ?: 10f
 
-    // ── Focus ─────────────────────────────────────────────────────────────────
-    fun tapToFocus(x: Float, y: Float) {
+    fun pinchZoom(scale: Float) = setZoom(_zoomLevel.value * scale)
+
+    fun getMaxZoom(): Float = camera?.cameraInfo?.zoomState?.value?.maxZoomRatio ?: 10f
+
+    /** Map a tap on the viewfinder (0..1, top-left origin) to the camera frame and build the metering action. */
+    private fun meteringAction(nx: Float, ny: Float, locked: Boolean): FocusMeteringAction? {
+        val pv = preview ?: return null
+        val sx = glPipeline.cropScaleX
+        val sy = glPipeline.cropScaleY
+        var cx = 0.5f + (nx - 0.5f) / sx
+        val cy = 0.5f + (ny - 0.5f) / sy
+        // the viewfinder is mirrored for the selfie camera, the camera frame is not
+        if (!_glFailed.value && glPipeline.mirrorDisplay) cx = 1f - cx
+        val factory = SurfaceOrientedMeteringPointFactory(1f, 1f, pv)
+        val point = factory.createPoint(cx.coerceIn(0f, 1f), cy.coerceIn(0f, 1f), 0.12f)
+        val builder = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
+        if (locked) builder.disableAutoCancel() else builder.setAutoCancelDuration(4, TimeUnit.SECONDS)
+        return builder.build()
+    }
+
+    fun tapToFocus(nx: Float, ny: Float) {
         if (_aeAfLocked.value) return
-        val factory = SurfaceOrientedMeteringPointFactory(previewWidth, previewHeight)
-        val pt: MeteringPoint = factory.createPoint(x, y, 0.1f)
-        val action = FocusMeteringAction.Builder(
-            pt, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
-            .setAutoCancelDuration(4, TimeUnit.SECONDS).build()
+        val action = meteringAction(nx, ny, false) ?: return
         camera?.cameraControl?.startFocusAndMetering(action)
     }
 
-    fun lockAeAf(x: Float, y: Float) {
-        val factory = SurfaceOrientedMeteringPointFactory(previewWidth, previewHeight)
-        val pt: MeteringPoint = factory.createPoint(x, y, 0.1f)
-        val action = FocusMeteringAction.Builder(
-            pt, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
-            .disableAutoCancel().build()
+    fun lockAeAf(nx: Float, ny: Float) {
+        val action = meteringAction(nx, ny, true) ?: return
         camera?.cameraControl?.startFocusAndMetering(action)
         _aeAfLocked.value = true
     }
@@ -247,252 +356,292 @@ class UltraCameraManager(private val context: Context) {
 
     fun setExposureCompensation(index: Int) = autoExposure.setManualEv(index)
 
-    // ── Flash ─────────────────────────────────────────────────────────────────
     fun toggleFlash() {
         val modes = FlashMode.entries.toTypedArray()
         _flashMode.value = modes[(modes.indexOf(_flashMode.value) + 1) % modes.size]
         imageCapture?.flashMode = _flashMode.value.toCX()
+        applyTorch()
     }
 
-    // ── Photo capture ─────────────────────────────────────────────────────────
-    fun capturePhoto(
-        onSaved:    (String) -> Unit,
-        onProgress: (String) -> Unit,
-        onDone:     (String) -> Unit,
-        onError:    (Exception) -> Unit
-    ) {
-        val ic = imageCapture ?: return onError(IllegalStateException("Camera not ready"))
-        _cameraState.value = CamState.CAPTURING
-
-        val displayName = "CamixUltra_${System.currentTimeMillis()}"
-        val options     = buildPhotoOutputOptions(displayName)
-
-        ic.takePicture(
-            options,
-            ContextCompat.getMainExecutor(context),
-            object : ImageCapture.OnImageSavedCallback {
-                override fun onImageSaved(out: ImageCapture.OutputFileResults) {
-                    _cameraState.value = CamState.READY
-                    onSaved("📸 Captured — enhancing…")
-                    val uri = out.savedUri ?: return
-                    _isProcessing.value = true
-
-                    computationalEngine.processAsync(
-                        uri         = uri,
-                        displayName = displayName,
-                        onProgress  = { msg ->
-                            _processingStatus.value = msg
-                            onProgress(msg)
-                        },
-                        onComplete = { enhancedBitmap ->
-                            scope.launch(Dispatchers.IO) {
-                                try {
-                                    writeBitmapToMediaStore(enhancedBitmap, "${displayName}_cx")
-                                    enhancedBitmap.recycle()
-                                    _isProcessing.value    = false
-                                    _processingStatus.value = ""
-                                    withContext(Dispatchers.Main) {
-                                        onDone("✨ Photo enhanced & saved to gallery")
-                                    }
-                                } catch (e: Exception) {
-                                    _isProcessing.value = false
-                                    Timber.e(e, "Write enhanced failed")
-                                    withContext(Dispatchers.Main) {
-                                        onDone("📸 Photo saved to gallery")
-                                    }
-                                }
-                            }
-                        },
-                        onError = { e ->
-                            _isProcessing.value    = false
-                            _processingStatus.value = ""
-                            Timber.e(e, "Computational engine failed — original kept")
-                            onDone("📸 Photo saved to gallery")
-                        }
-                    )
-                }
-                override fun onError(e: ImageCaptureException) {
-                    _cameraState.value = CamState.READY
-                    onError(e)
-                }
-            }
-        )
+    /** Flash "ON" doubles as a torch while a video is recording. */
+    private fun applyTorch() {
+        val on = _flashMode.value == FlashMode.ON && (_isRecording.value || _isTimelapse.value)
+        try { camera?.cameraControl?.enableTorch(on) } catch (_: Exception) { }
     }
 
-    // ── Video recording ───────────────────────────────────────────────────────
-    fun startRecording(
-        onStarted:  () -> Unit,
-        onFinished: (String) -> Unit,
-        onError:    (Exception) -> Unit
-    ) {
-        val vc      = videoCapture ?: return onError(IllegalStateException("Video not ready"))
-        val options = buildVideoOutputOptions()
+    fun hasFlash(): Boolean = camera?.cameraInfo?.hasFlashUnit() ?: false
 
-        recording = vc.output
-            .prepareRecording(context, options)
-            .withAudioEnabled()
-            .start(ContextCompat.getMainExecutor(context)) { event ->
-                when (event) {
-                    is VideoRecordEvent.Start -> {
-                        _isRecording.value = true
-                        _cameraState.value = CamState.RECORDING
-                        onStarted()
-                    }
-                    is VideoRecordEvent.Finalize -> {
-                        _isRecording.value = false
-                        _cameraState.value = CamState.READY
-                        if (event.hasError()) {
-                            onError(Exception("Recording error: ${event.cause?.message}"))
-                        } else {
-                            onFinished("🎥 Video saved to gallery")
-                        }
-                    }
-                }
-            }
-    }
+    // ══════════════════════════════════════════════════════════════════════════
+    // Look
+    // ══════════════════════════════════════════════════════════════════════════
 
-    fun stopRecording()   { recording?.stop();   recording = null }
-    fun pauseRecording()  { recording?.pause();  _cameraState.value = CamState.PAUSED   }
-    fun resumeRecording() { recording?.resume(); _cameraState.value = CamState.RECORDING }
-
-    // ── Time-lapse ────────────────────────────────────────────────────────────
-    fun startTimelapse(
-        intervalMs:      Long = 2_000L,
-        onFrameCaptured: (Int) -> Unit,
-        onError:         (Exception) -> Unit
-    ) {
-        _isTimelapse.value       = true
-        _timelapseCaptured.value = 0
-        timelapseJob = scope.launch {
-            while (isActive && _isTimelapse.value) {
-                capturePhoto(
-                    onSaved    = {},
-                    onProgress = {},
-                    onDone     = {
-                        _timelapseCaptured.value++
-                        onFrameCaptured(_timelapseCaptured.value)
-                    },
-                    onError = onError
-                )
-                delay(intervalMs)
-            }
-        }
-    }
-
-    fun stopTimelapse() {
-        _isTimelapse.value = false
-        timelapseJob?.cancel()
-        timelapseJob = null
-    }
-
-    // ── Camera switch ─────────────────────────────────────────────────────────
-    fun switchCamera(owner: LifecycleOwner, surfaceProvider: Preview.SurfaceProvider) {
-        lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK)
-            CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
-        bindUseCases(owner, surfaceProvider)
-    }
-
-    // ── Filters ───────────────────────────────────────────────────────────────
-    fun updateFilterParameters(params: FilterParameters) {
+    private fun applyLook(params: FilterParameters) {
         _filterParams.value = params
-        filterRenderer?.updateParameters(params)
+        glPipeline.setLook(params)
+    }
+
+    fun updateFilterParameters(params: FilterParameters) {
         isAutoEnhanceEnabled = params.isAutoEnabled
+        applyLook(params)
     }
 
     fun setAutoEnhance(enabled: Boolean) {
         isAutoEnhanceEnabled = enabled
         if (enabled) {
             autoExposure.enableAuto()
-            filterRenderer?.updateParameters(sceneDetector.suggestedParams.value)
+            applyLook(sceneDetector.suggestedParams.value)
         }
     }
 
-    fun setFilterRenderer(r: FilterRenderer) { filterRenderer = r }
-    fun updateAudioLevel(level: Float) = sceneDetector.updateAudioLevel(level)
+    // ══════════════════════════════════════════════════════════════════════════
+    // Photo
+    // ══════════════════════════════════════════════════════════════════════════
 
-    // ── MediaStore helpers ────────────────────────────────────────────────────
-    private fun buildPhotoOutputOptions(displayName: String): ImageCapture.OutputFileOptions {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val cv = ContentValues().apply {
-                put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
-                put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-                put(MediaStore.MediaColumns.RELATIVE_PATH,
-                    Environment.DIRECTORY_PICTURES + "/CamixUltra")
+    /**
+     * Full-resolution JPEG from the sensor, then the viewfinder's look is applied on the GPU at (up to)
+     * 4096 px and ONE correctly-oriented file is saved. With the "Original" look the camera's JPEG is saved untouched.
+     */
+    fun capturePhoto(
+        onProgress: (String) -> Unit,
+        onDone: (String) -> Unit,
+        onFail: (String) -> Unit
+    ) {
+        val ic = imageCapture
+        if (ic == null) { onFail("Camera not ready"); return }
+        if (_isProcessing.value) return
+
+        val raw = File(context.cacheDir, "raw_" + System.currentTimeMillis() + ".jpg")
+        _cameraState.value = CamState.CAPTURING
+        _isProcessing.value = true
+        _processingStatus.value = "Capturing…"
+
+        ic.takePicture(
+            ImageCapture.OutputFileOptions.Builder(raw).build(),
+            mainExecutor,
+            object : ImageCapture.OnImageSavedCallback {
+                override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                    processAndSave(raw, onProgress, onDone, onFail)
+                }
+
+                override fun onError(exception: ImageCaptureException) {
+                    raw.delete()
+                    _isProcessing.value = false
+                    _processingStatus.value = ""
+                    _cameraState.value = CamState.READY
+                    onFail("Capture failed: " + exception.message)
+                }
+            })
+    }
+
+    private fun processAndSave(
+        raw: File,
+        onProgress: (String) -> Unit,
+        onDone: (String) -> Unit,
+        onFail: (String) -> Unit
+    ) {
+        val params = _filterParams.value
+        scope.launch(Dispatchers.IO) {
+            var uri: Uri? = null
+            var withLook = false
+            val name = "CamixUltra_" + System.currentTimeMillis()
+            try {
+                if (!params.isNeutral()) {
+                    postProgress("Applying look…", onProgress)
+                    val bmp = stillRenderer.render(raw, params)
+                    if (bmp != null) {
+                        postProgress("Saving…", onProgress)
+                        uri = MediaStoreSaver.savePhotoBitmap(context, bmp, name, 95)
+                        withLook = uri != null
+                        bmp.recycle()
+                    }
+                }
+                if (uri == null) {
+                    postProgress("Saving…", onProgress)
+                    uri = MediaStoreSaver.savePhotoFile(context, raw, name)
+                }
+            } catch (t: Throwable) {
+                Timber.e(t, "processAndSave")
+            } finally {
+                raw.delete()
             }
-            ImageCapture.OutputFileOptions.Builder(
-                context.contentResolver,
-                MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv
-            ).build()
-        } else {
-            val dir = java.io.File(
-                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES),
-                "CamixUltra"
-            ).apply { if (!exists()) mkdirs() }
-            ImageCapture.OutputFileOptions.Builder(
-                java.io.File(dir, "$displayName.jpg")
-            ).build()
-        }
-    }
-
-    private fun buildVideoOutputOptions(): MediaStoreOutputOptions {
-        val cv = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME,
-                "CamixUltra_${System.currentTimeMillis()}")
-            put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
-                put(MediaStore.MediaColumns.RELATIVE_PATH,
-                    Environment.DIRECTORY_MOVIES + "/CamixUltra")
-        }
-        return MediaStoreOutputOptions.Builder(
-            context.contentResolver,
-            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-        ).setContentValues(cv).build()
-    }
-
-    private fun writeBitmapToMediaStore(
-        bitmap: android.graphics.Bitmap,
-        name: String
-    ): Uri {
-        val cv = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
-            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.MediaColumns.RELATIVE_PATH,
-                    Environment.DIRECTORY_PICTURES + "/CamixUltra")
-                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            withContext(Dispatchers.Main) {
+                _isProcessing.value = false
+                _processingStatus.value = ""
+                _cameraState.value = CamState.READY
+                if (uri != null) onDone(if (withLook) "Photo saved with your look" else "Photo saved")
+                else onFail("Could not save the photo")
             }
         }
-        val uri = context.contentResolver.insert(
-            MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)!!
-        context.contentResolver.openOutputStream(uri)?.use { out: OutputStream ->
-            bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 97, out)
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            cv.clear()
-            cv.put(MediaStore.MediaColumns.IS_PENDING, 0)
-            context.contentResolver.update(uri, cv, null, null)
-        }
-        return uri
     }
 
-    // ── Device info ───────────────────────────────────────────────────────────
-    fun hasFlash() = try {
-        val cm = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        cm.getCameraCharacteristics(cm.cameraIdList[0])
-            .get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
-    } catch (_: Exception) { false }
+    private suspend fun postProgress(text: String, cb: (String) -> Unit) {
+        withContext(Dispatchers.Main) {
+            _processingStatus.value = text
+            cb(text)
+        }
+    }
 
-    // ── Release ───────────────────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════════
+    // Video (look + Pulse baked in, processed audio)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    fun startRecording(
+        withAudio: Boolean,
+        onStarted: () -> Unit,
+        onError: (String) -> Unit
+    ) {
+        if (_isRecording.value || _isTimelapse.value) return
+        if (_glFailed.value) { onError("Live effects are unavailable on this device, so video recording is disabled"); return }
+        val w = glPipeline.contentWidth
+        val h = glPipeline.contentHeight
+        if (w <= 0 || h <= 0) { onError("Viewfinder not ready yet"); return }
+
+        val rec = VideoRecorder(context)
+        try {
+            val useAudio = withAudio && audio.isRunning.value
+            val surface = rec.prepare(w, h, useAudio, false)
+            val ok = glPipeline.startEncoder(surface, rec.width, rec.height, false) { ts -> rec.videoPtsNs(ts) }
+            if (!ok) {
+                rec.abort()
+                onError("Could not start the video encoder")
+                return
+            }
+            rec.start()
+            if (rec.isWithAudio) audio.sink = rec
+            recorder = rec
+            _isRecording.value = true
+            _cameraState.value = CamState.RECORDING
+            startTimer()
+            applyTorch()
+            onStarted()
+        } catch (t: Throwable) {
+            Timber.e(t, "startRecording failed")
+            glPipeline.stopEncoder()
+            rec.abort()
+            onError("Recording failed: " + t.message)
+        }
+    }
+
+    fun stopRecording(onFinished: (String) -> Unit, onError: (String) -> Unit) {
+        val rec = recorder ?: return
+        recorder = null
+        audio.sink = null
+        glPipeline.stopEncoder()
+        _isRecording.value = false
+        _cameraState.value = CamState.READY
+        stopTimer()
+        applyTorch()
+        finishRecorder(rec, "Video saved to Movies/CamixUltra", onFinished, onError)
+    }
+
+    private fun finishRecorder(
+        rec: VideoRecorder, okText: String,
+        onFinished: (String) -> Unit, onError: (String) -> Unit
+    ) {
+        _isProcessing.value = true
+        _processingStatus.value = "Finishing video…"
+        rec.stop { uri, error ->
+            scope.launch(Dispatchers.Main) {
+                _isProcessing.value = false
+                _processingStatus.value = ""
+                if (uri != null) onFinished(okText) else onError(error ?: "Recording failed")
+            }
+        }
+    }
+
+    private fun startTimer() {
+        _recordingSeconds.value = 0
+        timerJob?.cancel()
+        timerJob = scope.launch {
+            while (isActive) {
+                delay(1000)
+                _recordingSeconds.value = _recordingSeconds.value + 1
+            }
+        }
+    }
+
+    private fun stopTimer() {
+        timerJob?.cancel()
+        timerJob = null
+        _recordingSeconds.value = 0
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Time-lapse -> a real video (the old version saved hundreds of JPEGs, each run through the CPU engine)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    fun startTimelapse(
+        intervalMs: Long,
+        onStarted: () -> Unit,
+        onError: (String) -> Unit
+    ) {
+        if (_isTimelapse.value || _isRecording.value) return
+        if (_glFailed.value) { onError("Live effects are unavailable on this device, so time-lapse is disabled"); return }
+        val w = glPipeline.contentWidth
+        val h = glPipeline.contentHeight
+        if (w <= 0 || h <= 0) { onError("Viewfinder not ready yet"); return }
+
+        val rec = VideoRecorder(context)
+        try {
+            val surface = rec.prepare(w, h, false, true)
+            val ok = glPipeline.startEncoder(surface, rec.width, rec.height, true) { _ -> -1L }
+            if (!ok) {
+                rec.abort()
+                onError("Could not start the video encoder")
+                return
+            }
+            rec.start()
+            timelapseRecorder = rec
+            _isTimelapse.value = true
+            _timelapseCaptured.value = 0
+            _cameraState.value = CamState.RECORDING
+            applyTorch()
+            timelapseJob = scope.launch {
+                var i = 0L
+                while (isActive) {
+                    glPipeline.pushTimelapseFrame(i * 33_333_333L)     // plays back at 30 fps
+                    i++
+                    _timelapseCaptured.value = i.toInt()
+                    delay(intervalMs)
+                }
+            }
+            onStarted()
+        } catch (t: Throwable) {
+            Timber.e(t, "startTimelapse failed")
+            glPipeline.stopEncoder()
+            rec.abort()
+            onError("Time-lapse failed: " + t.message)
+        }
+    }
+
+    fun stopTimelapse(onFinished: (String) -> Unit, onError: (String) -> Unit) {
+        timelapseJob?.cancel()
+        timelapseJob = null
+        val rec = timelapseRecorder ?: return
+        timelapseRecorder = null
+        glPipeline.stopEncoder()
+        _isTimelapse.value = false
+        _cameraState.value = CamState.READY
+        applyTorch()
+        finishRecorder(rec, "Time-lapse video saved (" + _timelapseCaptured.value + " frames)", onFinished, onError)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Release
+    // ══════════════════════════════════════════════════════════════════════════
+
     fun release() {
-        stopTimelapse()
-        recording?.stop(); recording = null
+        timelapseJob?.cancel()
+        timerJob?.cancel()
+        audio.sink = null
+        recorder?.abort(); recorder = null
+        timelapseRecorder?.abort(); timelapseRecorder = null
         autoExposure.detach(); autoExposure.release()
-        enhancementPipeline.release()
-        computationalEngine.release()
-        scope.cancel()
-        cameraExecutor.shutdown()
         sceneDetector.release()
-        cameraProvider?.unbindAll()
+        try { cameraProvider?.unbindAll() } catch (_: Exception) { }
+        glPipeline.release()
+        analysisExecutor.shutdown()
+        scope.cancel()
     }
 
     // ── Enums ─────────────────────────────────────────────────────────────────

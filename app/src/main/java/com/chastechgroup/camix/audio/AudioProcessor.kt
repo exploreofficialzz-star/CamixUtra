@@ -1,277 +1,261 @@
 package com.chastechgroup.camix.audio
 
+import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Context
-import android.media.*
-import android.media.audiofx.AcousticEchoCanceler
-import android.media.audiofx.AutomaticGainControl
-import android.media.audiofx.NoiseSuppressor
-import android.os.Build
-import kotlinx.coroutines.*
+import android.content.pm.PackageManager
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import android.os.Process
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import timber.log.Timber
-import kotlin.math.*
+import kotlin.math.abs
+import kotlin.math.log10
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.sqrt
+
+/** Receives the processed (post-DSP) PCM that ends up in the recorded video. */
+interface AudioSink {
+    /** @param endNanos System.nanoTime() when the LAST sample of this chunk was captured. */
+    fun onAudio(pcm: ShortArray, count: Int, endNanos: Long)
+}
+
+enum class AudioPreset(val label: String) {
+    NATURAL("Natural"),   // gentle wind-rumble cut + limiter
+    VOICE("Voice"),       // rumble cut + spectral noise suppression + presence EQ + limiter
+    MUSIC("Music")        // only DC/rumble protection + limiter; keeps the music untouched
+}
 
 /**
- * CamixUltra AudioProcessor — fuses both packages' audio systems.
+ * The ONE owner of the microphone.
  *
- * Capabilities:
- *  • Hardware effects: NoiseSuppressor, AcousticEchoCanceler, AutomaticGainControl
- *  • DSP pipeline:
- *      1. Wind noise reduction (1st-order high-pass, fc = 200 Hz)
- *      2. Voice clarity enhancement (band-pass emphasis 1–4 kHz)
- *      3. Dynamic normalisation (peak limiter)
- *      4. Low-light audio boost (raises gain when scene is dark)
- *  • Real-time metering: RMS level, peak level, waveform snapshot (128 samples)
- *  • EnvironmentAnalyzer integration: noise floor dB estimate → SceneDetector
- *  • Supports CAMCORDER source for optimal camera-sync
+ *  raw mic ──► BeatDetector ──► AudioFeatures ──► PulseEngine (audio-reactive visuals)
+ *     │
+ *     └─► DSP chain (preset) ──► meter / waveform
+ *                           └──► AudioSink ──► AAC encoder ──► the MP4's audio track
+ *
+ * Previous versions ran this DSP on a *copy* used only for the on-screen meter while CameraX recorded the
+ * un-processed microphone, so none of the processing ever reached a saved video. Now the recorder consumes
+ * the processed stream directly, and only one AudioRecord exists (no concurrent-capture conflicts).
  */
 class AudioProcessor(private val context: Context) {
 
-    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    companion object {
+        const val SAMPLE_RATE = 44100
+        private const val CHUNK = 1024
+        private const val WAVEFORM_BINS = 128
+    }
 
-    // ── State flows ───────────────────────────────────────────────────────────
-
-    private val _isProcessing  = MutableStateFlow(false)
-    val isProcessing: StateFlow<Boolean> = _isProcessing.asStateFlow()
-
-    private val _rmsLevel      = MutableStateFlow(0f)   // 0..1 linear
+    // ── Observable state (UI) ─────────────────────────────────────────────────
+    private val _rmsLevel = MutableStateFlow(0f)
     val rmsLevel: StateFlow<Float> = _rmsLevel.asStateFlow()
 
-    private val _peakLevel     = MutableStateFlow(0f)
+    private val _peakLevel = MutableStateFlow(0f)
     val peakLevel: StateFlow<Float> = _peakLevel.asStateFlow()
 
-    private val _noiseFloorDb  = MutableStateFlow(-60f) // negative dBFS
+    private val _noiseFloorDb = MutableStateFlow(-90f)
     val noiseFloorDb: StateFlow<Float> = _noiseFloorDb.asStateFlow()
 
-    private val _waveform      = MutableStateFlow(FloatArray(128))
+    private val _waveform = MutableStateFlow(FloatArray(WAVEFORM_BINS))
     val waveform: StateFlow<FloatArray> = _waveform.asStateFlow()
 
-    // ── Hardware effects ──────────────────────────────────────────────────────
+    private val _bpm = MutableStateFlow(0f)
+    val bpm: StateFlow<Float> = _bpm.asStateFlow()
 
-    private var noiseSuppressor:       NoiseSuppressor?       = null
-    private var echoCanceler:          AcousticEchoCanceler?  = null
-    private var automaticGainControl:  AutomaticGainControl?  = null
+    /** Increments on every kick – drives the beat dot in the UI. */
+    private val _kickCount = MutableStateFlow(0)
+    val kickCount: StateFlow<Int> = _kickCount.asStateFlow()
 
-    // ── DSP settings ──────────────────────────────────────────────────────────
+    private val _isRunning = MutableStateFlow(false)
+    val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
 
-    var noiseSuppressionEnabled  = true
-    var echoCancellationEnabled  = true
-    var autoGainEnabled          = true
-    var windReductionEnabled     = true
-    var voiceClarityLevel        = 0.55f   // 0..1
-    var lowLightGainBoost        = 0f      // set by CameraViewModel (0..1)
+    // ── Hooks ─────────────────────────────────────────────────────────────────
+    @Volatile var sink: AudioSink? = null
+    @Volatile var featureListener: ((AudioFeatures) -> Unit)? = null
+    @Volatile var preset: AudioPreset = AudioPreset.NATURAL
 
-    // ── Audio record ─────────────────────────────────────────────────────────
+    // ── Internals ─────────────────────────────────────────────────────────────
+    private var thread: Thread? = null
+    @Volatile private var running = false
 
-    private var audioRecord: AudioRecord? = null
-    private var processingJob: Job?       = null
+    fun hasPermission(): Boolean =
+        ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
 
-    private val sampleRate    = 48_000
-    private val channelConfig = AudioFormat.CHANNEL_IN_MONO
-    private val encoding      = AudioFormat.ENCODING_PCM_16BIT
-    private val bufferSize: Int by lazy {
-        AudioRecord.getMinBufferSize(sampleRate, channelConfig, encoding) * 4
+    /** @return true when capture is running (or already was). */
+    @SuppressLint("MissingPermission")   // permission is verified by hasPermission() right below
+    @Synchronized
+    fun start(): Boolean {
+        if (running) return true
+        if (!hasPermission()) {
+            Timber.w("AudioProcessor: RECORD_AUDIO not granted")
+            return false
+        }
+        val minBuf = AudioRecord.getMinBufferSize(
+            SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        if (minBuf <= 0) {
+            Timber.e("AudioProcessor: getMinBufferSize=%d", minBuf)
+            return false
+        }
+        val bufBytes = max(minBuf * 2, CHUNK * 2 * 8)
+        val rec: AudioRecord = try {
+            AudioRecord(MediaRecorder.AudioSource.CAMCORDER, SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufBytes)
+        } catch (t: Throwable) {
+            Timber.e(t, "AudioProcessor: AudioRecord construction failed")
+            return false
+        }
+        if (rec.state != AudioRecord.STATE_INITIALIZED) {
+            Timber.e("AudioProcessor: AudioRecord not initialised (mic busy?)")
+            rec.release()
+            return false
+        }
+        running = true
+        _isRunning.value = true
+        thread = Thread({ captureLoop(rec) }, "camix-audio").also { it.start() }
+        return true
     }
 
-    // Noise-floor estimation (rolling min RMS over 2-second window)
-    private val rmsRing = ArrayDeque<Float>(60)
+    @Synchronized
+    fun stop() {
+        running = false
+        val t = thread
+        thread = null
+        try { t?.join(800) } catch (_: InterruptedException) { }
+        _isRunning.value = false
+    }
 
-    // ── Lifecycle ─────────────────────────────────────────────────────────────
+    fun release() = stop()
 
-    fun setupAudioProcessing() {
+    // ── Capture thread ────────────────────────────────────────────────────────
+
+    private fun captureLoop(rec: AudioRecord) {
         try {
-            audioRecord = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                AudioRecord.Builder()
-                    .setAudioSource(MediaRecorder.AudioSource.CAMCORDER)
-                    .setAudioFormat(
-                        AudioFormat.Builder()
-                            .setEncoding(encoding)
-                            .setSampleRate(sampleRate)
-                            .setChannelMask(channelConfig)
-                            .build()
-                    )
-                    .setBufferSizeInBytes(bufferSize)
-                    .build()
-            } else {
-                @Suppress("DEPRECATION")
-                AudioRecord(MediaRecorder.AudioSource.CAMCORDER,
-                    sampleRate, channelConfig, encoding, bufferSize)
+            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+        } catch (_: Throwable) { }
+
+        try {
+            rec.startRecording()
+        } catch (t: Throwable) {
+            Timber.e(t, "AudioProcessor: startRecording failed")
+            rec.release()
+            running = false
+            _isRunning.value = false
+            return
+        }
+
+        val beat = BeatDetector(SAMPLE_RATE)
+        val pcm = ShortArray(CHUNK)
+        val raw = FloatArray(CHUNK)
+        val proc = FloatArray(CHUNK)
+        val out = ShortArray(CHUNK)
+        val rmsRing = FloatArray(90)            // ~2 s of chunk RMS values for the noise floor
+        var ringPos = 0
+        var ringCount = 0
+        var wfTick = 0
+        var lastBpm = 0f
+
+        var appliedPreset: AudioPreset? = null
+        var hp: Biquad? = null
+        var presence: Biquad? = null
+        var denoiser: SpectralDenoiser? = null
+
+        while (running) {
+            val n = rec.read(pcm, 0, CHUNK)
+            if (n < 0) {
+                Timber.e("AudioProcessor: read error %d", n)
+                break
+            }
+            if (n == 0) continue
+            val endNs = System.nanoTime()
+
+            for (i in 0 until n) {
+                val f = pcm[i] / 32768f
+                raw[i] = f
+                proc[i] = f
             }
 
-            audioRecord?.audioSessionId?.let { initHardwareEffects(it) }
-            Timber.d("AudioProcessor: AudioRecord ready (session=${audioRecord?.audioSessionId})")
-        } catch (e: Exception) {
-            Timber.e(e, "AudioProcessor: setup failed")
-        }
-    }
+            // 1) analysis on the RAW signal (the DSP below would eat bass / stationary music)
+            val onsets = beat.process(raw, n)
+            if (onsets.kick > 0f) _kickCount.value = _kickCount.value + 1
+            val features = AudioFeatures(
+                rms = beat.rms, bass = beat.bass, mid = beat.mid, high = beat.high,
+                kick = onsets.kick, hit = onsets.hit, bpm = beat.bpm, bpmConfidence = beat.bpmConfidence)
+            featureListener?.invoke(features)
+            if (abs(beat.bpm - lastBpm) > 0.5f) { lastBpm = beat.bpm; _bpm.value = beat.bpm }
 
-    fun initHardwareEffects(sessionId: Int) {
-        if (NoiseSuppressor.isAvailable() && noiseSuppressionEnabled) {
-            noiseSuppressor = NoiseSuppressor.create(sessionId)?.apply { enabled = true }
-            Timber.d("NoiseSuppressor enabled")
-        }
-        if (AcousticEchoCanceler.isAvailable() && echoCancellationEnabled) {
-            echoCanceler = AcousticEchoCanceler.create(sessionId)?.apply { enabled = true }
-            Timber.d("AcousticEchoCanceler enabled")
-        }
-        if (AutomaticGainControl.isAvailable() && autoGainEnabled) {
-            automaticGainControl = AutomaticGainControl.create(sessionId)?.apply { enabled = true }
-            Timber.d("AutomaticGainControl enabled")
-        }
-    }
-
-    fun startProcessing() {
-        if (_isProcessing.value) return
-        _isProcessing.value = true
-
-        processingJob = scope.launch {
-            try {
-                audioRecord?.startRecording()
-                val buf = ShortArray(bufferSize / 2)
-                while (isActive && _isProcessing.value) {
-                    val read = audioRecord?.read(buf, 0, buf.size) ?: break
-                    if (read > 0) {
-                        val processed = applyDspPipeline(buf.copyOf(), read)
-                        updateMetrics(processed, read)
+            // 2) DSP chain (rebuilt on this thread whenever the preset changes)
+            val wanted = preset
+            if (wanted != appliedPreset) {
+                appliedPreset = wanted
+                when (wanted) {
+                    AudioPreset.NATURAL -> { hp = Biquad.highpass(SAMPLE_RATE, 80.0);  presence = null; denoiser = null }
+                    AudioPreset.VOICE   -> {
+                        hp = Biquad.highpass(SAMPLE_RATE, 140.0)
+                        presence = Biquad.peaking(SAMPLE_RATE, 3000.0, 3.0)
+                        denoiser = SpectralDenoiser()
                     }
+                    AudioPreset.MUSIC   -> { hp = Biquad.highpass(SAMPLE_RATE, 35.0);  presence = null; denoiser = null }
                 }
-            } catch (e: Exception) {
-                Timber.e(e, "AudioProcessor: processing loop error")
+            }
+            hp?.process(proc, n)
+            denoiser?.process(proc, n)
+            presence?.process(proc, n)
+            SoftLimiter.process(proc, n)
+
+            // 3) meter + waveform of what is actually recorded
+            var sumSq = 0.0
+            var peak = 0f
+            for (i in 0 until n) {
+                val v = proc[i]
+                sumSq += (v * v).toDouble()
+                val a = abs(v)
+                if (a > peak) peak = a
+            }
+            val rms = sqrt(sumSq / n).toFloat()
+            _rmsLevel.value = min(1f, rms * 3f)
+            _peakLevel.value = min(1f, peak)
+            rmsRing[ringPos] = rms
+            ringPos = (ringPos + 1) % rmsRing.size
+            if (ringCount < rmsRing.size) ringCount++
+            if (++wfTick % 2 == 0) {
+                var minRms = Float.MAX_VALUE
+                for (i in 0 until ringCount) if (rmsRing[i] < minRms) minRms = rmsRing[i]
+                _noiseFloorDb.value = if (minRms > 1e-6f) 20f * log10(minRms) else -90f
+
+                val wf = FloatArray(WAVEFORM_BINS)
+                val per = max(1, n / WAVEFORM_BINS)
+                for (b in 0 until WAVEFORM_BINS) {
+                    var m = 0f
+                    val s = b * per
+                    for (i in s until min(n, s + per)) m = max(m, abs(proc[i]))
+                    wf[b] = min(1f, m * 2f)
+                }
+                _waveform.value = wf
+            }
+
+            // 4) recorder tap
+            val s = sink
+            if (s != null) {
+                for (i in 0 until n) {
+                    val v = proc[i]
+                    val c = if (v > 1f) 1f else if (v < -1f) -1f else v
+                    out[i] = (c * 32767f).toInt().toShort()
+                }
+                s.onAudio(out, n, endNs)
             }
         }
-    }
 
-    fun stopProcessing() {
-        _isProcessing.value = false
-        processingJob?.cancel()
-        try { audioRecord?.stop() } catch (_: Exception) {}
-    }
-
-    fun release() {
-        stopProcessing()
-        scope.cancel()
-        noiseSuppressor?.release()
-        echoCanceler?.release()
-        automaticGainControl?.release()
-        audioRecord?.release()
-        noiseSuppressor       = null
-        echoCanceler          = null
-        automaticGainControl  = null
-        audioRecord           = null
-        Timber.d("AudioProcessor released")
-    }
-
-    // ── DSP Pipeline ─────────────────────────────────────────────────────────
-
-    private fun applyDspPipeline(buf: ShortArray, size: Int): ShortArray {
-        var out = buf
-        if (windReductionEnabled)   out = reduceWind(out, size)
-        if (voiceClarityLevel > 0f) out = enhanceVoice(out, size)
-        out = applyLowLightBoost(out, size)
-        out = normalize(out, size)
-        return out
-    }
-
-    /** 1st-order IIR high-pass at 200 Hz to kill wind rumble */
-    private fun reduceWind(buf: ShortArray, size: Int): ShortArray {
-        val rc    = 1.0 / (2.0 * PI * 200.0)
-        val dt    = 1.0 / sampleRate
-        val alpha = (rc / (rc + dt)).toFloat()
-        var prevIn = 0f; var prevOut = 0f
-        for (i in 0 until size) {
-            val x    = buf[i].toFloat()
-            val y    = alpha * (prevOut + x - prevIn)
-            buf[i]   = y.toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
-            prevIn   = x; prevOut = y
-        }
-        return buf
-    }
-
-    /** Band-emphasis for speech frequencies (1–4 kHz) via sharpened moving average */
-    private fun enhanceVoice(buf: ShortArray, size: Int): ShortArray {
-        val gain   = 1f + voiceClarityLevel * 0.55f
-        val win    = (sampleRate / 2000).coerceIn(2, 22)
-        for (i in win until size - win) {
-            var sum = 0f
-            for (j in -win..win) sum += buf[i + j]
-            val avg  = sum / (win * 2 + 1)
-            val diff = buf[i] - avg
-            buf[i]   = (avg + diff * gain).toInt()
-                .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
-        }
-        return buf
-    }
-
-    /** Raise gain slightly when scene is dark (user is likely recording in low-light) */
-    private fun applyLowLightBoost(buf: ShortArray, size: Int): ShortArray {
-        if (lowLightGainBoost <= 0.01f) return buf
-        val gain = 1f + lowLightGainBoost * 0.5f
-        for (i in 0 until size) {
-            buf[i] = (buf[i] * gain).toInt()
-                .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
-        }
-        return buf
-    }
-
-    /** Peak limiter: prevent clipping above 90 % */
-    private fun normalize(buf: ShortArray, size: Int): ShortArray {
-        var peak = 0
-        for (i in 0 until size) peak = max(peak, abs(buf[i].toInt()))
-        val threshold = Short.MAX_VALUE * 0.90
-        if (peak > threshold) {
-            val gain = threshold / peak.toFloat()
-            for (i in 0 until size) buf[i] = (buf[i] * gain).toInt().toShort()
-        }
-        return buf
-    }
-
-    // ── Metering ──────────────────────────────────────────────────────────────
-
-    private fun updateMetrics(buf: ShortArray, size: Int) {
-        // RMS
-        var sum = 0.0
-        var peak = 0
-        for (i in 0 until size) {
-            val v = buf[i].toInt()
-            sum  += v.toDouble().pow(2)
-            peak  = max(peak, abs(v))
-        }
-        val rms = (sqrt(sum / size) / Short.MAX_VALUE).toFloat().coerceIn(0f, 1f)
-        val pk  = (peak / Short.MAX_VALUE.toFloat()).coerceIn(0f, 1f)
-        _rmsLevel.value  = rms
-        _peakLevel.value = pk
-
-        // Noise-floor estimation (rolling 2-s min of RMS)
-        rmsRing.addLast(rms)
-        if (rmsRing.size > 60) rmsRing.removeFirst()
-        val floorLinear = rmsRing.min()
-        val floorDb = if (floorLinear > 0f) 20f * log10(floorLinear) else -90f
-        _noiseFloorDb.value = floorDb
-
-        // Waveform snapshot (downsample to 128 bins)
-        val wf = FloatArray(128)
-        val step = max(1, size / 128)
-        for (i in wf.indices) {
-            wf[i] = buf[min(i * step, size - 1)].toFloat() / Short.MAX_VALUE
-        }
-        _waveform.value = wf
-    }
-
-    // ── Configuration ─────────────────────────────────────────────────────────
-
-    fun configure(
-        noiseSuppression: Boolean = true,
-        echoCancellation: Boolean = true,
-        autoGain: Boolean         = true,
-        windReduction: Boolean    = true,
-        clarity: Float            = 0.55f
-    ) {
-        noiseSuppressionEnabled  = noiseSuppression
-        echoCancellationEnabled  = echoCancellation
-        autoGainEnabled          = autoGain
-        windReductionEnabled     = windReduction
-        voiceClarityLevel        = clarity.coerceIn(0f, 1f)
+        try { rec.stop() } catch (_: Throwable) { }
+        rec.release()
+        running = false
+        _isRunning.value = false
+        _rmsLevel.value = 0f
+        _peakLevel.value = 0f
     }
 }

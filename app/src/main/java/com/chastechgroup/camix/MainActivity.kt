@@ -38,7 +38,13 @@ class MainActivity : ComponentActivity() {
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { results -> permissionsGranted = results.values.all { it } }
+    ) { results ->
+        // Only the camera is mandatory. The microphone is optional (Pulse + sound in videos).
+        permissionsGranted = results[Manifest.permission.CAMERA] == true || cameraGranted()
+    }
+
+    private fun cameraGranted() =
+        checkSelfPermission(Manifest.permission.CAMERA) == android.content.pm.PackageManager.PERMISSION_GRANTED
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -48,9 +54,7 @@ class MainActivity : ComponentActivity() {
             systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        permissionsGranted = requiredPermissions.all {
-            checkSelfPermission(it) == android.content.pm.PackageManager.PERMISSION_GRANTED
-        }
+        permissionsGranted = cameraGranted()
         setContent {
             CamixTheme {
                 AnimatedContent(targetState = permissionsGranted,
@@ -71,7 +75,7 @@ fun PermissionRationale(onRequest: () -> Unit) {
         Column(horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(16.dp),
             modifier = Modifier.padding(32.dp)) {
-            Text("CamixUltra needs camera and microphone access to capture ultra-realistic photos and videos.",
+            Text("CamixUltra needs the camera to work. Microphone access is optional: it powers Pulse (visuals that move with the beat) and sound in your videos.",
                 style = MaterialTheme.typography.bodyMedium, color = Color(0xFF9E9E9E),
                 textAlign = TextAlign.Center)
             Button(onClick = onRequest,

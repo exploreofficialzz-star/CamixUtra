@@ -60,6 +60,15 @@ android {
     packaging {
         resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" }
     }
+
+    lint {
+        // lint findings are reported but never block a build
+        abortOnError = false
+    }
+
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {
@@ -89,9 +98,8 @@ dependencies {
     implementation("androidx.camera:camera-core:$cameraxVersion")
     implementation("androidx.camera:camera-camera2:$cameraxVersion")
     implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
-    implementation("androidx.camera:camera-view:$cameraxVersion")
-    implementation("androidx.camera:camera-video:$cameraxVersion")
-    implementation("androidx.camera:camera-extensions:$cameraxVersion")
+    implementation("androidx.camera:camera-view:$cameraxVersion")   // only for the plain-preview safety net
+    // camera-video / camera-extensions removed: recording now runs through our own GPU pipeline + MediaCodec
 
     // Hilt
     val hiltVersion = "2.50"

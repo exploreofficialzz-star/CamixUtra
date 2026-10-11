@@ -1,31 +1,30 @@
 package com.chastechgroup.camix.filter
 
-import android.graphics.Bitmap
-import android.graphics.ImageFormat
-import android.graphics.Rect
-import android.graphics.YuvImage
 import androidx.camera.core.ImageProxy
-import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import timber.log.Timber
-import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
 import kotlin.math.abs
-import kotlin.math.sqrt
+import kotlin.math.max
+import kotlin.math.min
 
 /**
  * Real-time scene detector for CamixUltra.
  *
- * Merges the environment-analysis logic from both packages and adds:
- *  • Macro detection via high-frequency content ratio
- *  • Audio-level input for reactive adjustments (from pkg1 EnvironmentAnalyzer concept)
- *  • Smooth parameter blending (temporal IIR filter) to avoid flickering
- *  • Histogram-based exposure assessment
+ *  - Reads the camera's YUV_420_888 planes DIRECTLY (stride-aware, ~12 000 sample points). The previous
+ *    implementation pushed only the luma plane through a "YUV -> JPEG -> Bitmap" round trip, which returned
+ *    garbage colour statistics and allocated several MB every analysis tick.
+ *  - Produces smoothed ImageStats, a scene type (with a stability gate), filter suggestions for AI Auto and a
+ *    REAL RGB histogram for the histogram overlay (the old overlay drew a fixed bell curve).
+ *
+ * Runs inline on the CameraX analysis thread (~1 ms per analysed frame, every 12th frame).
  */
 class SceneDetector {
 
-    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    /** 64-bin histograms, each normalised so its largest bin is 1.0 */
+    class HistogramData(val r: FloatArray, val g: FloatArray, val b: FloatArray, val luma: FloatArray)
 
     private val _detectedScene   = MutableStateFlow(SceneType.AUTO)
     val detectedScene: StateFlow<SceneType> = _detectedScene.asStateFlow()
@@ -33,183 +32,208 @@ class SceneDetector {
     private val _suggestedParams = MutableStateFlow(FilterParameters.DEFAULT)
     val suggestedParams: StateFlow<FilterParameters> = _suggestedParams.asStateFlow()
 
-    private val _audioNoiseFloor = MutableStateFlow(0f) // dB-normalized 0..1
-    val audioNoiseFloor: StateFlow<Float> = _audioNoiseFloor.asStateFlow()
-
-    // Raw image stats — fed into AutoExposureController
     private val _sceneStats = MutableStateFlow<ImageStats?>(null)
     val sceneStats: StateFlow<ImageStats?> = _sceneStats.asStateFlow()
 
-    private var isProcessing   = false
-    private var frameCounter   = 0
-    private val SKIP_FRAMES    = 12          // ~2 Hz at 24 fps preview
+    private val _histogram = MutableStateFlow<HistogramData?>(null)
+    val histogram: StateFlow<HistogramData?> = _histogram.asStateFlow()
 
-    // IIR smoothing (α = 0.25 → blends 25 % new + 75 % old each tick)
-    private var smoothBrightness = 0.5
-    private var smoothContrast   = 0.5
-    private var smoothSaturation = 0.3
-    private var lastScene        = SceneType.AUTO
-    private var sceneStability   = 0         // prevents rapid scene switches
+    @Volatile var enabled: Boolean = true
+
+    private var frameCounter = 0
+    private val skipFrames = 12                       // ~2 Hz at 24-30 fps
+
+    // IIR smoothing (initialised from the first real frame)
+    private var haveSmooth = false
+    private var smoothBrightness = 0.0
+    private var smoothContrast = 0.0
+    private var smoothSaturation = 0.0
+    private var lastScene = SceneType.AUTO
+    private var sceneStability = 0
 
     // ── Public API ────────────────────────────────────────────────────────────
 
-    fun processFrame(imageProxy: ImageProxy) {
-        frameCounter++
-        if (frameCounter % SKIP_FRAMES != 0) { imageProxy.close(); return }
-        if (isProcessing)                     { imageProxy.close(); return }
-
-        isProcessing = true
-        scope.launch {
-            try {
-                val bmp = imageProxy.toBitmap()
-                if (bmp != null) { analyzeScene(bmp); bmp.recycle() }
-            } catch (e: Exception) {
-                Timber.e(e, "SceneDetector: analysis error")
-            } finally {
-                isProcessing = false
-                imageProxy.close()
-            }
+    /** Always closes [image]. */
+    fun processFrame(image: ImageProxy) {
+        try {
+            frameCounter++
+            if (!enabled || frameCounter % skipFrames != 0) return
+            val stats = sample(image) ?: return
+            analyze(stats)
+        } catch (e: Exception) {
+            Timber.e(e, "SceneDetector: analysis error")
+        } finally {
+            image.close()
         }
     }
 
-    /** Inject real-time audio level from AudioProcessor (0..1 normalised) */
-    fun updateAudioLevel(normalizedLevel: Float) {
-        _audioNoiseFloor.value = normalizedLevel.coerceIn(0f, 1f)
+    fun release() { enabled = false }
+
+    // ── Sampling ──────────────────────────────────────────────────────────────
+
+    private fun byteAt(buf: ByteBuffer, index: Int): Int =
+        if (index >= 0 && index < buf.limit()) buf.get(index).toInt() and 0xFF else 128
+
+    private fun sample(image: ImageProxy): ImageStats? {
+        val planes = image.planes
+        if (planes.size < 3) return null
+        val w = image.width
+        val h = image.height
+        if (w < 16 || h < 16) return null
+
+        val yBuf = planes[0].buffer; val yRow = planes[0].rowStride; val yPix = planes[0].pixelStride
+        val uBuf = planes[1].buffer; val uRow = planes[1].rowStride; val uPix = planes[1].pixelStride
+        val vBuf = planes[2].buffer; val vRow = planes[2].rowStride; val vPix = planes[2].pixelStride
+
+        val stepX = max(1, w / 120)
+        val stepY = max(1, h / 96)
+
+        val lumaHist = IntArray(256)
+        val rHist = IntArray(64)
+        val gHist = IntArray(64)
+        val bHist = IntArray(64)
+
+        var n = 0
+        var sumL = 0.0; var sumS = 0.0; var sumW = 0.0
+        var dark = 0; var bright = 0; var skin = 0
+        var hf = 0.0
+
+        var y = 0
+        while (y < h) {
+            var prevL = -1.0
+            var x = 0
+            while (x < w) {
+                val yy = byteAt(yBuf, y * yRow + x * yPix)
+                val cx = x shr 1
+                val cy = y shr 1
+                val u = byteAt(uBuf, cy * uRow + cx * uPix) - 128
+                val v = byteAt(vBuf, cy * vRow + cx * vPix) - 128
+
+                val r = clamp255(yy + 1.402 * v)
+                val g = clamp255(yy - 0.344136 * u - 0.714136 * v)
+                val b = clamp255(yy + 1.772 * u)
+
+                val lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+                val li = min(255, max(0, lum.toInt()))
+                lumaHist[li]++
+                rHist[r shr 2]++; gHist[g shr 2]++; bHist[b shr 2]++
+
+                sumL += lum
+                val mx = max(r, max(g, b)); val mn = min(r, min(g, b))
+                sumS += if (mx > 0) (mx - mn).toDouble() / mx else 0.0
+                sumW += (r - b) / 255.0
+                if (lum < 50) dark++
+                if (lum > 200) bright++
+
+                val cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b
+                val cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b
+                if (cr in 140.0..180.0 && cb in 90.0..130.0) skin++
+
+                if (prevL >= 0.0) hf += abs(lum - prevL)
+                prevL = lum
+                n++
+                x += stepX
+            }
+            y += stepY
+        }
+        if (n == 0) return null
+
+        // robust contrast: 99.5th - 0.5th percentile of the luma histogram
+        val lowCut = (n * 0.005).toInt()
+        var acc = 0; var p0 = 0
+        for (i in 0 until 256) { acc += lumaHist[i]; if (acc > lowCut) { p0 = i; break } }
+        acc = 0; var p1 = 255
+        for (i in 255 downTo 0) { acc += lumaHist[i]; if (acc > lowCut) { p1 = i; break } }
+
+        var mid = 0
+        for (i in 85..170) mid += lumaHist[i]
+
+        publishHistogram(lumaHist, rHist, gHist, bHist)
+
+        return ImageStats(
+            avgBrightness   = sumL / n,
+            avgSaturation   = sumS / n,
+            avgWarmth       = sumW / n,
+            contrast        = (p1 - p0).toDouble(),
+            skinRatio       = skin.toDouble() / n,
+            darkRatio       = dark.toDouble() / n,
+            brightRatio     = bright.toDouble() / n,
+            exposureBalance = mid.toDouble() / n,
+            minBrightness   = p0.toDouble(),
+            maxBrightness   = p1.toDouble(),
+            hfEnergyRatio   = hf / n / 255.0
+        )
     }
 
-    fun release() = scope.cancel()
+    private fun clamp255(v: Double): Int = if (v < 0.0) 0 else if (v > 255.0) 255 else v.toInt()
 
-    // ── Analysis pipeline ─────────────────────────────────────────────────────
+    private fun publishHistogram(luma: IntArray, r: IntArray, g: IntArray, b: IntArray) {
+        val l64 = IntArray(64)
+        for (i in 0 until 256) l64[i shr 2] += luma[i]
+        _histogram.value = HistogramData(norm(r), norm(g), norm(b), norm(l64))
+    }
 
-    private fun analyzeScene(bitmap: Bitmap) {
-        val sample = Bitmap.createScaledBitmap(bitmap, bitmap.width / 6, bitmap.height / 6, true)
-        val stats  = computeStats(sample)
-        sample.recycle()
+    private fun norm(h: IntArray): FloatArray {
+        var m = 1
+        for (v in h) if (v > m) m = v
+        return FloatArray(h.size) { h[it].toFloat() / m }
+    }
 
-        // IIR smooth stats
-        val α = 0.25
-        smoothBrightness = α * stats.avgBrightness + (1 - α) * smoothBrightness
-        smoothContrast   = α * stats.contrast       + (1 - α) * smoothContrast
-        smoothSaturation = α * stats.avgSaturation  + (1 - α) * smoothSaturation
+    // ── Analysis ──────────────────────────────────────────────────────────────
 
+    private fun analyze(stats: ImageStats) {
+        val a = 0.25
+        if (!haveSmooth) {
+            haveSmooth = true
+            smoothBrightness = stats.avgBrightness
+            smoothContrast = stats.contrast
+            smoothSaturation = stats.avgSaturation
+        } else {
+            smoothBrightness = a * stats.avgBrightness + (1 - a) * smoothBrightness
+            smoothContrast   = a * stats.contrast       + (1 - a) * smoothContrast
+            smoothSaturation = a * stats.avgSaturation  + (1 - a) * smoothSaturation
+        }
         val smoothed = stats.copy(
             avgBrightness = smoothBrightness,
-            contrast      = smoothContrast,
+            contrast = smoothContrast,
             avgSaturation = smoothSaturation
         )
 
         val scene = detectScene(smoothed)
+        if (scene == lastScene) sceneStability++ else { sceneStability = 0; lastScene = scene }
+        val committed = if (sceneStability >= 3) scene else _detectedScene.value
 
-        // Scene stability gate: require 3 consecutive detections before committing
-        if (scene == lastScene) {
-            sceneStability++
-        } else {
-            sceneStability = 0
-            lastScene = scene
-        }
-        val committedScene = if (sceneStability >= 3) scene else _detectedScene.value
-        _detectedScene.value = committedScene
-        _sceneStats.value    = smoothed
-        _suggestedParams.value = computeParams(committedScene, smoothed)
-
-        Timber.d("Scene=$committedScene  B=%.2f  C=%.2f  S=%.2f".format(
-            smoothBrightness, smoothContrast, smoothSaturation))
+        _detectedScene.value = committed
+        _sceneStats.value = smoothed
+        _suggestedParams.value = computeParams(committed, smoothed)
     }
 
-    // ── Image statistics ──────────────────────────────────────────────────────
-
-    private fun computeStats(bmp: Bitmap): ImageStats {
-        val w = bmp.width; val h = bmp.height
-        val pixels = IntArray(w * h)
-        bmp.getPixels(pixels, 0, w, 0, 0, w, h)
-
-        val histogram = IntArray(256)
-        var sumL = 0.0; var sumS = 0.0; var sumW = 0.0
-        var minL = 255.0; var maxL = 0.0
-        var darkPx = 0; var brightPx = 0; var skinPx = 0
-        var hfEnergy = 0.0  // high-frequency (edge) energy for macro detection
-
-        val N = pixels.size
-
-        for (i in pixels.indices) {
-            val px = pixels[i]
-            val r  = (px shr 16) and 0xFF
-            val g  = (px shr 8)  and 0xFF
-            val b  =  px         and 0xFF
-            val lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
-            val li  = lum.toInt().coerceIn(0, 255)
-            histogram[li]++
-            sumL += lum; minL = minOf(minL, lum); maxL = maxOf(maxL, lum)
-
-            val mx = maxOf(r, g, b); val mn = minOf(r, g, b)
-            sumS += if (mx > 0) (mx - mn).toDouble() / mx else 0.0
-            sumW += (r - b) / 255.0
-
-            if (lum < 50)  darkPx++
-            if (lum > 200) brightPx++
-
-            // Skin tone (YCbCr heuristic)
-            val cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b
-            val cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b
-            if (cr in 140.0..180.0 && cb in 90.0..130.0) skinPx++
-
-            // High-frequency energy (simple row-diff Laplacian)
-            if (i % w > 0) {
-                val prev = pixels[i - 1]
-                val diff = abs(lum - (0.2126 * ((prev shr 16) and 0xFF) +
-                                     0.7152 * ((prev shr 8)  and 0xFF) +
-                                     0.0722 * (prev           and 0xFF)))
-                hfEnergy += diff
-            }
-        }
-
-        val midtones = histogram.copyOfRange(85, 171).sum()
-
-        return ImageStats(
-            avgBrightness  = sumL / N,
-            avgSaturation  = sumS / N,
-            avgWarmth      = sumW / N,
-            contrast       = maxL - minL,
-            skinRatio      = skinPx.toDouble() / N,
-            darkRatio      = darkPx.toDouble() / N,
-            brightRatio    = brightPx.toDouble() / N,
-            exposureBalance= midtones.toDouble() / N,
-            minBrightness  = minL,
-            maxBrightness  = maxL,
-            hfEnergyRatio  = hfEnergy / N / 255.0
-        )
-    }
-
-    // ── Scene classification ──────────────────────────────────────────────────
-
-    private fun detectScene(s: ImageStats) = when {
-        s.skinRatio    in 0.07..0.70
-                                             -> SceneType.PORTRAIT
+    private fun detectScene(s: ImageStats): SceneType = when {
+        s.skinRatio in 0.07..0.70
+                                        -> SceneType.PORTRAIT
         s.avgBrightness < 30 && s.darkRatio > 0.65
-                                             -> SceneType.NIGHT
+                                        -> SceneType.NIGHT
         s.avgBrightness < 70 && s.darkRatio > 0.40
-                                             -> SceneType.LOW_LIGHT
-        s.brightRatio  > 0.30 && s.contrast > 145
-                                             -> SceneType.BACKLIT
-        s.avgWarmth    > 0.15 && s.avgBrightness in 55.0..155.0 && s.avgSaturation > 0.28
-                                             -> SceneType.SUNSET
+                                        -> SceneType.LOW_LIGHT
+        s.brightRatio > 0.30 && s.contrast > 145
+                                        -> SceneType.BACKLIT
+        s.avgWarmth > 0.15 && s.avgBrightness in 55.0..155.0 && s.avgSaturation > 0.28
+                                        -> SceneType.SUNSET
         s.avgSaturation > 0.32 && s.avgBrightness in 75.0..185.0 && s.hfEnergyRatio > 0.04
-                                             -> SceneType.FOOD
+                                        -> SceneType.FOOD
         s.avgSaturation < 0.13 && s.contrast > 175
-                                             -> SceneType.TEXT
+                                        -> SceneType.TEXT
         s.hfEnergyRatio > 0.12 && s.avgBrightness in 60.0..180.0
-                                             -> SceneType.MACRO
+                                        -> SceneType.MACRO
         s.avgBrightness in 80.0..200.0 && s.contrast in 75.0..185.0 && s.avgSaturation > 0.22
-                                             -> SceneType.LANDSCAPE
+                                        -> SceneType.LANDSCAPE
         s.avgBrightness in 45.0..125.0 && s.avgWarmth > 0.01
-                                             -> SceneType.INDOOR
+                                        -> SceneType.INDOOR
         s.avgBrightness > 145 && s.avgSaturation > 0.13
-                                             -> SceneType.OUTDOOR
-        s.contrast > 145                     -> SceneType.ACTION
-        else                                 -> SceneType.AUTO
+                                        -> SceneType.OUTDOOR
+        s.contrast > 145                -> SceneType.ACTION
+        else                            -> SceneType.AUTO
     }
-
-    // ── Parameter computation ─────────────────────────────────────────────────
 
     private fun computeParams(scene: SceneType, s: ImageStats): FilterParameters {
         val b = s.avgBrightness; val sat = s.avgSaturation; val w = s.avgWarmth; val c = s.contrast
@@ -235,12 +259,14 @@ class SceneDetector {
                 brightness = 0.38f, contrast = 0.14f, saturation = -0.1f, exposure = 0.48f,
                 warmth = 0.05f, highlights = -0.24f, shadows = 0.34f,
                 grain = 0.04f, sharpen = 0.15f,
+                style = StyleMode.NIGHT, styleIntensity = 0.7f,
                 isAutoEnabled = true, detectedScene = scene, confidence = 0.92f)
 
             SceneType.LOW_LIGHT -> FilterParameters(
                 brightness = 0.24f, contrast = 0.1f, exposure = 0.3f,
                 shadows = 0.24f, highlights = -0.14f,
                 saturation = if (sat < 0.2) 0.1f else 0f, grain = 0.03f,
+                style = StyleMode.NIGHT, styleIntensity = 0.45f,
                 isAutoEnabled = true, detectedScene = scene, confidence = 0.86f)
 
             SceneType.BACKLIT   -> FilterParameters(
@@ -290,17 +316,6 @@ class SceneDetector {
                 isAutoEnabled = true, detectedScene = scene, confidence = 0.5f)
         }
     }
-
-    // ── ImageProxy → Bitmap ───────────────────────────────────────────────────
-
-    private fun ImageProxy.toBitmap(): Bitmap? = try {
-        val buf   = planes[0].buffer
-        val bytes = ByteArray(buf.remaining()).also { buf.get(it) }
-        val yuv   = YuvImage(bytes, ImageFormat.NV21, width, height, null)
-        val out   = ByteArrayOutputStream()
-        yuv.compressToJpeg(Rect(0, 0, width, height), 45, out)
-        android.graphics.BitmapFactory.decodeByteArray(out.toByteArray(), 0, out.size())
-    } catch (e: Exception) { Timber.e(e, "ImageProxy→Bitmap failed"); null }
 
     // ── Data ──────────────────────────────────────────────────────────────────
 

@@ -3,21 +3,17 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Optional: Pulse (audio-reactive visuals) and sound in videos -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
-    <!-- Legacy storage for Android 9 and below -->
+    <!-- Saving to the gallery needs no permission on Android 10+; legacy storage only for Android 9 and below.
+         (READ_MEDIA_IMAGES / READ_MEDIA_VIDEO / READ_EXTERNAL_STORAGE / FLASHLIGHT / VIBRATE / MODIFY_AUDIO_SETTINGS
+          were removed: the app never reads other apps' media, and requesting them can trigger Play photo/video-policy review.) -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
-    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"  android:maxSdkVersion="32" />
-    <!-- Android 13+ granular media permissions -->
-    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
-    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
-    <uses-permission android:name="android.permission.FLASHLIGHT" />
-    <uses-permission android:name="android.permission.VIBRATE" />
 
     <uses-feature android:name="android.hardware.camera"           android:required="true" />
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
     <uses-feature android:name="android.hardware.camera.flash"     android:required="false" />
-    <uses-feature android:name="android.hardware.microphone"       android:required="true" />
+    <uses-feature android:name="android.hardware.microphone"       android:required="false" />
 
     <application
         android:name=".CamixApp"

@@ -5,11 +5,14 @@ import timber.log.Timber
 
 /**
  * Wraps an OpenGL ES 2.0 program (vertex + fragment shader).
- * Provides typed uniform setters used by FilterRenderer.
+ * Must be created and used on the GL thread that owns the current EGL context.
+ * Uniform / attribute locations are cached (glGetUniformLocation is a string lookup).
  */
 class ShaderProgram(vertexSource: String, fragmentSource: String) {
 
     private val programHandle: Int
+    private val uniforms = HashMap<String, Int>()
+    private val attribs  = HashMap<String, Int>()
 
     init {
         val vs = compileShader(GLES20.GL_VERTEX_SHADER,   vertexSource)
@@ -23,19 +26,25 @@ class ShaderProgram(vertexSource: String, fragmentSource: String) {
 
     fun release() {
         GLES20.glDeleteProgram(programHandle)
+        uniforms.clear(); attribs.clear()
     }
 
     // ── Attribute / Uniform locations ─────────────────────────────────────────
 
     fun getAttribLocation(name: String): Int =
-        GLES20.glGetAttribLocation(programHandle, name)
+        attribs.getOrPut(name) { GLES20.glGetAttribLocation(programHandle, name) }
 
     private fun uniformLocation(name: String): Int =
-        GLES20.glGetUniformLocation(programHandle, name)
+        uniforms.getOrPut(name) { GLES20.glGetUniformLocation(programHandle, name) }
 
     fun setFloat(name: String, value: Float) {
         val loc = uniformLocation(name)
         if (loc >= 0) GLES20.glUniform1f(loc, value)
+    }
+
+    fun setVec2(name: String, x: Float, y: Float) {
+        val loc = uniformLocation(name)
+        if (loc >= 0) GLES20.glUniform2f(loc, x, y)
     }
 
     fun setInt(name: String, value: Int) {

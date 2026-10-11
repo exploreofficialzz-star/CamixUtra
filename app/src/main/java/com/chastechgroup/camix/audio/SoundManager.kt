@@ -5,15 +5,12 @@ import android.media.AudioAttributes
 import android.media.SoundPool
 import com.chastechgroup.camix.R
 import timber.log.Timber
-import javax.inject.Inject
-import javax.inject.Singleton
 
 /**
  * Manages all camera UI sounds using SoundPool for low-latency playback.
  * Every button action gets audio feedback.
  */
-@Singleton
-class SoundManager @Inject constructor(private val context: Context) {
+class SoundManager(private val context: Context) {
 
     private val pool: SoundPool = SoundPool.Builder()
         .setMaxStreams(4)
@@ -33,12 +30,7 @@ class SoundManager @Inject constructor(private val context: Context) {
     private var aeAfLockSoundId      = 0
     private var modeSwitchSoundId    = 0
 
-    private var loaded = false
-
     init {
-        pool.setOnLoadCompleteListener { _, _, status ->
-            if (status == 0) loaded = true
-        }
         load()
     }
 
@@ -77,7 +69,7 @@ class SoundManager @Inject constructor(private val context: Context) {
     }
 
     fun release() {
-        pool.release()
+        try { pool.release() } catch (_: Exception) { }
         Timber.d("SoundManager released")
     }
 }

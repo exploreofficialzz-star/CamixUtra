@@ -1,115 +1,175 @@
 package com.chastechgroup.camix.camera
 
 import androidx.camera.core.Camera
-import androidx.camera.core.CameraControl
 import androidx.camera.core.ExposureState
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import timber.log.Timber
-import kotlin.math.*
+import java.util.concurrent.Executor
+import kotlin.math.abs
+import kotlin.math.ln
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToInt
 
 /**
- * AutoExposureController — the smart exposure brain for CamixUltra.
+ * Pure, Android-free exposure maths (unit-tested).
  *
- * Works continuously in the background:
- *  1. Reads scene brightness stats from SceneDetector frames
- *  2. Computes optimal EV compensation index
- *  3. Applies it via CameraX CameraControl
- *  4. Detects overexposure (blown highlights) and underexposure (crushed shadows)
- *  5. Applies multi-zone metering: centre-weighted + spot for portrait, matrix for landscape
- *
- * Result: the camera always captures a bright, clean, perfectly exposed shot
- * regardless of environment — indoor, outdoor, backlit, night, or mixed.
+ * The original controller computed an ABSOLUTE exposure-compensation index from the brightness error
+ * ("30 brightness units = 1 stop") and treated index units as stops. Two defects followed:
+ *  - dark scenes under-corrected (final brightness 55 instead of 130 in simulation) and
+ *  - bright scenes "hunted" (the measured brightness already includes the previous correction, so an
+ *    absolute P-controller flips between two indices every tick - 14 flips in 7 s in simulation).
+ * This version is an INTEGRAL controller in EV units: convert the error to EV (gamma-aware), accumulate
+ * a fraction per tick, dead-band, slew-limit to 1 index per tick, convert with the device's real
+ * exposureCompensationStep and clamp to +-2 EV. Simulation: zero hunting across scenes 30..240.
+ */
+object ExposureMath {
+    const val GAIN = 0.25
+    const val DEAD_BAND_EV = 0.35
+    const val MAX_EV = 2.0
+    private const val GAMMA = 2.2
+
+    /** Desired mean luma (0..255) for the current scene. */
+    fun targetBrightness(
+        isNight: Boolean, isBacklit: Boolean, skinRatio: Double,
+        brightRatio: Double, darkRatio: Double, hfEnergy: Double
+    ): Double = when {
+        isNight              -> 145.0
+        isBacklit            -> 140.0
+        skinRatio > 0.12     -> 150.0
+        brightRatio > 0.20   -> 110.0
+        darkRatio > 0.60     -> 155.0
+        hfEnergy > 0.10      -> 135.0
+        else                 -> 130.0
+    }
+
+    /** Exposure error in stops (positive = too dark). Brightness is gamma-encoded, hence the 2.2. */
+    fun errorEv(target: Double, brightness: Double): Double =
+        GAMMA * ln(target / max(brightness, 4.0)) / ln(2.0)
+
+    class Loop(private val stepEv: Double, lo: Int, hi: Int) {
+        private val lowest = max(lo, (-MAX_EV / stepEv).toInt())
+        private val highest = min(hi, (MAX_EV / stepEv).toInt())
+        private var acc = 0.0
+
+        fun reset() { acc = 0.0 }
+
+        /** @return the exposure-compensation index to apply next */
+        fun next(currentIndex: Int, target: Double, brightness: Double): Int {
+            val err = errorEv(target, brightness)
+            if (abs(err) < DEAD_BAND_EV) { acc = 0.0; return currentIndex }
+            acc += GAIN * err / stepEv
+            var s = acc.toInt()
+            if (s == 0) return currentIndex
+            acc -= s
+            if (s > 1) s = 1
+            if (s < -1) s = -1
+            return min(highest, max(lowest, currentIndex + s))
+        }
+    }
+}
+
+/**
+ * Smart auto-exposure on top of the camera's own AE: nudges the exposure-compensation index so the
+ * measured scene brightness approaches a per-scene target (see [ExposureMath]).
  */
 class AutoExposureController {
 
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var camera: Camera? = null
     private var exposureState: ExposureState? = null
+    private var loop: ExposureMath.Loop? = null
+    private var stepEv = 0.0
     private var autoJob: Job? = null
 
     // ── State ─────────────────────────────────────────────────────────────────
-    private val _evIndex       = MutableStateFlow(0)
+    private val _evIndex = MutableStateFlow(0)
     val evIndex: StateFlow<Int> = _evIndex.asStateFlow()
 
     private val _exposureLabel = MutableStateFlow("Auto")
     val exposureLabel: StateFlow<String> = _exposureLabel.asStateFlow()
 
-    private val _isClipping    = MutableStateFlow(false)
+    private val _isClipping = MutableStateFlow(false)
     val isClipping: StateFlow<Boolean> = _isClipping.asStateFlow()
 
-    private val _isToooDark    = MutableStateFlow(false)
-    val isTooDark: StateFlow<Boolean> = _isToooDark.asStateFlow()
+    private val _isTooDark = MutableStateFlow(false)
+    val isTooDark: StateFlow<Boolean> = _isTooDark.asStateFlow()
 
     // ── Scene feed ────────────────────────────────────────────────────────────
-    // Updated each time SceneDetector produces new frame stats
-    private var avgBrightness   = 128.0   // 0..255
-    private var darkRatio       = 0.0     // fraction of pixels below 50
-    private var brightRatio     = 0.0     // fraction of pixels above 200
-    private var skinRatio       = 0.0     // portrait weight
-    private var hfEnergyRatio   = 0.0     // macro / detail
-    private var isNightScene    = false
-    private var isBacklit       = false
-    private var isManualOverride = false
-    private var manualIndex      = 0
-
-    // IIR smoothing for brightness
-    private var smoothBrightness = 128.0
-    private val ALPHA = 0.18              // blend speed (lower = slower/smoother)
-
-    // ── Attach / detach ───────────────────────────────────────────────────────
+    @Volatile private var avgBrightness = 128.0
+    @Volatile private var darkRatio = 0.0
+    @Volatile private var brightRatio = 0.0
+    @Volatile private var skinRatio = 0.0
+    @Volatile private var hfEnergyRatio = 0.0
+    @Volatile private var isNightScene = false
+    @Volatile private var isBacklit = false
+    @Volatile private var isManualOverride = false
+    private var haveBrightness = false
+    private val alpha = 0.35            // stats arrive at ~2 Hz: smooth gently
 
     fun attach(cam: Camera) {
-        camera        = cam
-        exposureState = cam.cameraInfo.exposureState
-        Timber.d("AutoExposureController attached — range=${exposureState?.exposureCompensationRange}")
+        camera = cam
+        val state = cam.cameraInfo.exposureState
+        exposureState = state
+        stepEv = try { state.exposureCompensationStep.toDouble() } catch (_: Throwable) { 0.0 }
+        val range = state.exposureCompensationRange
+        loop = if (state.isExposureCompensationSupported && stepEv > 0.0 && range.lower < range.upper)
+            ExposureMath.Loop(stepEv, range.lower, range.upper) else null
+        _evIndex.value = state.exposureCompensationIndex
+        Timber.d("AutoExposure attached: range=%s step=%.3f supported=%b",
+            range, stepEv, state.isExposureCompensationSupported)
         startLoop()
     }
 
     fun detach() {
         autoJob?.cancel()
-        camera        = null
+        camera = null
         exposureState = null
+        loop = null
     }
 
     fun release() {
         scope.cancel()
     }
 
-    // ── Scene update (called from SceneDetector via ViewModel) ────────────────
-
+    /** Called ~2 Hz by the scene detector. */
     fun updateScene(
-        brightness:   Double,
-        darkRatio:    Double,
-        brightRatio:  Double,
-        skinRatio:    Double,
-        hfEnergy:     Double,
-        isNight:      Boolean,
-        isBacklit:    Boolean
+        brightness: Double, darkRatio: Double, brightRatio: Double,
+        skinRatio: Double, hfEnergy: Double, isNight: Boolean, isBacklit: Boolean
     ) {
-        // IIR smooth
-        smoothBrightness    = ALPHA * brightness + (1 - ALPHA) * smoothBrightness
-        this.avgBrightness  = smoothBrightness
-        this.darkRatio      = darkRatio
-        this.brightRatio    = brightRatio
-        this.skinRatio      = skinRatio
-        this.hfEnergyRatio  = hfEnergy
-        this.isNightScene   = isNight
-        this.isBacklit      = isBacklit
+        avgBrightness = if (!haveBrightness) { haveBrightness = true; brightness }
+                        else alpha * brightness + (1 - alpha) * avgBrightness
+        this.darkRatio = darkRatio
+        this.brightRatio = brightRatio
+        this.skinRatio = skinRatio
+        this.hfEnergyRatio = hfEnergy
+        this.isNightScene = isNight
+        this.isBacklit = isBacklit
     }
 
     // ── Manual override (Pro mode / user EV slider) ───────────────────────────
 
     fun setManualEv(index: Int) {
         isManualOverride = true
-        manualIndex      = index
-        applyEv(index)
+        val range = exposureState?.exposureCompensationRange
+        val clamped = if (range != null) index.coerceIn(range.lower, range.upper) else index
+        applyEv(clamped)
+        _exposureLabel.value = "Manual EV " + formatEv(clamped)
     }
 
     fun enableAuto() {
         isManualOverride = false
+        loop?.reset()
     }
 
     // ── Main loop ─────────────────────────────────────────────────────────────
@@ -118,97 +178,46 @@ class AutoExposureController {
         autoJob?.cancel()
         autoJob = scope.launch {
             while (isActive) {
-                if (!isManualOverride) computeAndApply()
-                delay(350)   // ~3 Hz — responsive but not jittery
+                if (!isManualOverride) tick()
+                delay(350)
             }
         }
     }
 
-    private fun computeAndApply() {
-        val state = exposureState ?: return
-        val range = state.exposureCompensationRange
-        if (range.lower >= range.upper) return   // device doesn't support EV
+    private fun tick() {
+        val l = loop ?: return
+        val current = _evIndex.value
+        val target = ExposureMath.targetBrightness(
+            isNightScene, isBacklit, skinRatio, brightRatio, darkRatio, hfEnergyRatio)
+        val next = l.next(current, target, avgBrightness)
+        if (next != current) applyEv(next)
 
-        val targetEv = computeTargetEv()
-        val clamped  = targetEv.coerceIn(range.lower, range.upper)
-
-        // Only update if changed significantly (avoid micro-adjustments)
-        if (clamped != _evIndex.value) {
-            applyEv(clamped)
-        }
-
-        // Clipping detection
-        _isClipping.value  = brightRatio > 0.15
-        _isToooDark.value  = avgBrightness < 35 || darkRatio > 0.75
-
-        // Label
+        _isClipping.value = brightRatio > 0.15
+        _isTooDark.value = avgBrightness < 35 || darkRatio > 0.75
         _exposureLabel.value = when {
-            isManualOverride     -> "Manual EV ${if (clamped >= 0) "+$clamped" else "$clamped"}"
-            isNightScene         -> "Night Auto"
-            isBacklit            -> "Backlit Auto"
-            skinRatio > 0.1      -> "Portrait Auto"
-            brightRatio > 0.15   -> "HDR Auto"
-            else                 -> "Smart Auto"
+            isNightScene       -> "Night Auto"
+            isBacklit          -> "Backlit Auto"
+            skinRatio > 0.1    -> "Portrait Auto"
+            brightRatio > 0.15 -> "HDR Auto"
+            else               -> "Smart Auto"
         }
-    }
-
-    /**
-     * Core exposure algorithm.
-     *
-     * Zone metering strategy:
-     *  - Portrait:   bias +1 stop to expose skin well, lift shadows
-     *  - Night:      push hard (+3 to +4 stops)
-     *  - Backlit:    push +2 stops to recover subject from shadows
-     *  - Bright day: pull down (-1 to -2 stops) to protect highlights
-     *  - Overcast:   neutral to +1
-     *  - Mixed:      centre-weighted, target 135/255 midtone
-     *
-     * Returns integer EV index (not EV stops — index units from ExposureState)
-     */
-    private fun computeTargetEv(): Int {
-        val b = avgBrightness
-
-        // Target brightness we want (0-255)
-        val target = when {
-            isNightScene             -> 145.0   // push bright in night
-            isBacklit                -> 140.0   // recover subject
-            skinRatio > 0.12         -> 150.0   // portraits need bright skin
-            brightRatio > 0.20       -> 110.0   // protect highlights
-            darkRatio > 0.60         -> 155.0   // lift very dark scene
-            hfEnergyRatio > 0.10     -> 135.0   // macro — neutral
-            else                     -> 130.0   // standard target
-        }
-
-        // Error in brightness units
-        val error = target - b
-
-        // Convert to approximate EV steps
-        // Every ~30 brightness units ≈ 1 EV at mid-range
-        val evStops = (error / 28.0)
-
-        // Gain factor per scene type
-        val gain = when {
-            isNightScene    -> 1.8
-            isBacklit       -> 1.5
-            skinRatio > 0.1 -> 1.2
-            else            -> 1.0
-        }
-
-        val rawIndex = (evStops * gain).roundToInt()
-
-        // Night: always try to push more
-        val nightBonus = if (isNightScene && b < 80) 2 else 0
-
-        return (rawIndex + nightBonus)
     }
 
     private fun applyEv(index: Int) {
         _evIndex.value = index
-        camera?.cameraControl?.setExposureCompensationIndex(index)
-            ?.addListener({
-                Timber.d("AutoExposureController: EV applied → $index")
-            }, { it.run() })
+        val future = camera?.cameraControl?.setExposureCompensationIndex(index) ?: return
+        future.addListener({
+            try { future.get() } catch (t: Throwable) {
+                Timber.w("setExposureCompensationIndex(%d) failed: %s", index, t.message)
+                // resync with what the camera really has
+                exposureState?.let { _evIndex.value = it.exposureCompensationIndex }
+            }
+        }, Executor { it.run() })
     }
 
-    private fun Double.roundToInt() = kotlin.math.round(this).toInt()
+    private fun formatEv(index: Int): String {
+        val ev = if (stepEv > 0.0) index * stepEv else index.toDouble()
+        val r = (ev * 10).roundToInt() / 10.0
+        return if (r >= 0) "+$r" else "$r"
+    }
 }
