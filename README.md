@@ -22,7 +22,7 @@ audio/AudioProcessor (single mic owner) ─► BeatDetector ─► pulse/PulseEn
                                          └► DSP chain ─► meter + AudioSink ─► AAC track
 ```
 If the GPU path cannot start on a device, the UI falls back to a plain CameraX preview (photos still work).
-See `AUDIT.md` for the full list of fixes and the verification limits.
+New here? Read `START_HERE.md` (plain English). Technical detail: `AUDIT.md`.
 
 ## Build
 ```

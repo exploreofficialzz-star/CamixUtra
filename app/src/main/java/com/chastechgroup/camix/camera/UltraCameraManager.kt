@@ -20,6 +20,7 @@ import com.chastechgroup.camix.filter.FilterParameters
 import com.chastechgroup.camix.filter.SceneDetector
 import com.chastechgroup.camix.filter.SceneType
 import com.chastechgroup.camix.gl.CameraGlPipeline
+import com.chastechgroup.camix.gl.GlMath
 import com.chastechgroup.camix.gl.StillRenderer
 import com.chastechgroup.camix.pulse.PulseEngine
 import com.chastechgroup.camix.record.VideoRecorder
@@ -191,7 +192,9 @@ class UltraCameraManager(
         val res = request.resolution
         val front = lensFacing == CameraSelector.LENS_FACING_FRONT
         request.setTransformationInfoListener(mainExecutor) { info ->
-            glPipeline.updateTransform(info.rotationDegrees, front)
+            // the camera orientation is already inside SurfaceTexture.getTransformMatrix(); we only add what is left
+            val sensor = camera?.cameraInfo?.sensorRotationDegrees ?: info.rotationDegrees
+            glPipeline.updateTransform(info.rotationDegrees, sensor, front)
         }
         glPipeline.createCameraSurface(res.width, res.height) { surface ->
             if (surface == null) {
@@ -329,8 +332,12 @@ class UltraCameraManager(
         val cy = 0.5f + (ny - 0.5f) / sy
         // the viewfinder is mirrored for the selfie camera, the camera frame is not
         if (!_glFailed.value && glPipeline.mirrorDisplay) cx = 1f - cx
+        // CameraX metering points live in the camera's own (sensor / buffer) orientation, not in the upright frame
+        val sensor = camera?.cameraInfo?.sensorRotationDegrees ?: 90
+        val remaining = if (_glFailed.value) 0 else glPipeline.remainingRotation
+        val b = GlMath.frameToBuffer(cx.coerceIn(0f, 1f), cy.coerceIn(0f, 1f), remaining, sensor)
         val factory = SurfaceOrientedMeteringPointFactory(1f, 1f, pv)
-        val point = factory.createPoint(cx.coerceIn(0f, 1f), cy.coerceIn(0f, 1f), 0.12f)
+        val point = factory.createPoint(b[0].coerceIn(0f, 1f), b[1].coerceIn(0f, 1f), 0.12f)
         val builder = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
         if (locked) builder.disableAutoCancel() else builder.setAutoCancelDuration(4, TimeUnit.SECONDS)
         return builder.build()

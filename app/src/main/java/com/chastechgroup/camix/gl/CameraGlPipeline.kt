@@ -66,6 +66,9 @@ class CameraGlPipeline(private val listener: Listener) {
         private set
     @Volatile var mirrorDisplay: Boolean = false
         private set
+    /** extra clockwise rotation applied on top of SurfaceTexture.getTransformMatrix() (0 for portrait phones) */
+    @Volatile var remainingRotation: Int = 0
+        private set
     @Volatile private var released = false
 
     // ── GL-thread state ───────────────────────────────────────────────────────
@@ -93,7 +96,8 @@ class CameraGlPipeline(private val listener: Listener) {
     private var fboB: Fbo? = null
     private val inputs = ArrayList<CameraInput>()
     private var input: CameraInput? = null
-    private var rotationDeg = 90
+    private var infoRotation = 90      // TransformationInfo.rotationDegrees (sensor -> target rotation)
+    private var sensorRotation = 90    // camera orientation that SurfaceTexture.getTransformMatrix() already contains
     private var display: WindowTarget? = null
     private var encoder: EncoderTarget? = null
     private var currentLook: FilterParameters = lookTarget
@@ -180,10 +184,17 @@ class CameraGlPipeline(private val listener: Listener) {
         }
     }
 
-    /** Rotation CameraX asks for (clockwise degrees) and whether the viewfinder is mirrored (selfie). */
-    fun updateTransform(rotationDegrees: Int, mirror: Boolean) {
+    /**
+     * @param rotationDegrees        TransformationInfo.rotationDegrees (clockwise, sensor -> target rotation)
+     * @param sensorRotationDegrees  CameraInfo.sensorRotationDegrees: the part of it that the camera already baked
+     *                               into the SurfaceTexture transform matrix
+     * @param mirror                 mirror the viewfinder (selfie camera)
+     */
+    fun updateTransform(rotationDegrees: Int, sensorRotationDegrees: Int, mirror: Boolean) {
         handler.post {
-            rotationDeg = ((rotationDegrees % 360) + 360) % 360
+            infoRotation = ((rotationDegrees % 360) + 360) % 360
+            sensorRotation = ((sensorRotationDegrees % 360) + 360) % 360
+            remainingRotation = (((infoRotation - sensorRotation) % 360) + 360) % 360
             mirrorDisplay = mirror
         }
     }
@@ -304,9 +315,8 @@ class CameraGlPipeline(private val listener: Listener) {
             inp.lastTs = camTs
             inp.texture.getTransformMatrix(stMatrix)
 
-            val rot = rotationDeg
-            val up = GlMath.uprightSize(inp.bufW, inp.bufH, rot)
-            val size = contentSize(up[0], up[1])
+            val plan = GlMath.plan(inp.bufW, inp.bufH, infoRotation, sensorRotation)
+            val size = contentSize(plan.uprightW, plan.uprightH)
             ensureTargets(size[0], size[1])
             val base = baseFbo ?: return
             val fa = fboA ?: return
@@ -321,7 +331,7 @@ class CameraGlPipeline(private val listener: Listener) {
 
             // [A] camera (external) -> upright base frame
             base.bind()
-            q.draw(copy, GlMath.cameraToUpright(inp.bufW, inp.bufH, rot), stMatrix,
+            q.draw(copy, GlMath.cameraToUpright(plan.naturalW, plan.naturalH, plan.remainingDegrees), stMatrix,
                 GLES11Ext.GL_TEXTURE_EXTERNAL_OES, inp.texId)
 
             // [B] look

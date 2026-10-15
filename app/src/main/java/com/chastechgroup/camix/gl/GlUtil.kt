@@ -157,6 +157,49 @@ object GlMath {
         return m
     }
 
+    /**
+     * What has to happen to a camera frame so it ends up upright.
+     *
+     * IMPORTANT (verified against the CameraX docs): for a Surface backed by a SurfaceTexture the camera writes
+     * its orientation into the buffer, so SurfaceTexture.getTransformMatrix() ALREADY rotates the picture into the
+     * device's natural orientation (that is why TextureView "handles this automatically"). The only extra rotation an
+     * app has to add is the display rotation = TransformationInfo.rotationDegrees minus the sensor rotation
+     * (0 for a portrait-locked phone). Applying rotationDegrees on top of the matrix would turn the picture sideways.
+     */
+    class OrientationPlan(
+        val remainingDegrees: Int,      // extra clockwise rotation WE apply
+        val naturalW: Int, val naturalH: Int,   // size after SurfaceTexture.getTransformMatrix()
+        val uprightW: Int, val uprightH: Int    // size after our extra rotation
+    )
+
+    fun plan(bufW: Int, bufH: Int, infoRotationDegrees: Int, sensorRotationDegrees: Int): OrientationPlan {
+        val remaining = (((infoRotationDegrees - sensorRotationDegrees) % 360) + 360) % 360
+        val nat = uprightSize(bufW, bufH, sensorRotationDegrees)
+        val up = uprightSize(nat[0], nat[1], remaining)
+        return OrientationPlan(remaining, nat[0], nat[1], up[0], up[1])
+    }
+
+    /**
+     * Inverse of a clockwise quarter-turn on normalised coordinates (origin top-left, y down):
+     * given a point of the ROTATED image, returns the same point in the image BEFORE the rotation.
+     */
+    fun undoRotation(u: Float, v: Float, degrees: Int): FloatArray = when (((degrees % 360) + 360) % 360) {
+        90   -> floatArrayOf(v, 1f - u)
+        180  -> floatArrayOf(1f - u, 1f - v)
+        270  -> floatArrayOf(1f - v, u)
+        else -> floatArrayOf(u, v)
+    }
+
+    /**
+     * A point in the upright, un-mirrored frame (what the user sees) -> the same point in the camera's own
+     * buffer / sensor orientation, which is what CameraX metering points (SurfaceOrientedMeteringPointFactory)
+     * expect. Same maths as CameraX's DisplayOrientedMeteringPointFactory.
+     */
+    fun frameToBuffer(u: Float, v: Float, remainingDegrees: Int, sensorDegrees: Int): FloatArray {
+        val natural = undoRotation(u, v, remainingDegrees)
+        return undoRotation(natural[0], natural[1], sensorDegrees)
+    }
+
     /** Dimensions of the upright frame for a camera buffer + rotation. */
     fun uprightSize(bufW: Int, bufH: Int, rotationDeg: Int): IntArray {
         val rot = ((rotationDeg % 360) + 360) % 360

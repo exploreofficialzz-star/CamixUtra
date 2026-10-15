@@ -18,7 +18,7 @@
 | 5 | **High** | **Shader semantic bugs:** highlights slider inverted (negative = *added* light, so BACKLIT "recovery" blew highlights); dehaze and clarity re-sampled the texture and silently discarded sharpen/dehaze; vignette used `smoothstep` with `edge0 > edge1` (undefined in GLSL ES); cinematic letterbox worked in sensor space (wrong axis once the frame is rotated); Portrait preset had `blur = 0` so its shader was unreachable (same for Night/Vivid). | Rewritten shader library; every look runs on the upright frame; presets select their style explicitly. GLSL lint: 0 findings, all 12 programs' uniforms are set. |
 | 6 | **High** | **"Original" did not turn AI Auto off** (the default `FilterParameters` has `isAutoEnabled = true`); manual slider edits were applied to a stale copy and overwritten by AI Auto twice a second. | Every non-Auto preset sets `isAutoEnabled = false`; sliders start from the look on screen. |
 | 7 | **High** | **Auto-exposure:** absolute P-controller treating EV *index* as stops. Simulation (camera-AE lag model): dark scene (brightness 40) settled at **55** instead of ~130; bright scene (200) **hunted, 14 index flips in the 2nd half**; manual EV was never clamped to the device range. | Integral controller in EV units with dead-band, 1-index slew limit, real `exposureCompensationStep`, ±2 EV clamp. Same simulation: 0 flips for scenes 70–240, converges to 123–135. |
-| 8 | Medium | Tap-to-focus used view pixels with a factory that assumes the whole sensor frame while the preview is centre-cropped → focus landed off-target; the focus ring hid early after repeated taps; tapping while locked moved the ring without refocusing. | Tap is mapped through the exact crop/mirror (verified numerically) into the camera frame; tap while locked unlocks. |
+| 8 | Medium | Tap-to-focus used view pixels with a factory that assumes the whole sensor frame while the preview is centre-cropped → focus landed off-target; the focus ring hid early after repeated taps; tapping while locked moved the ring without refocusing. | Tap is mapped through the exact crop/mirror (verified numerically) and then into the camera's sensor orientation (see 1b-B); tap while locked unlocks. |
 | 9 | Medium | **ViewModel:** `cameraStarted` guard ⇒ black preview after activity re-creation; start/stop beeps were recorded into every video; leaving Thermal/Cinematic/Portrait/Night kept that look in Photo; Hilt `CameraModule` provided singletons nobody injected (and `SoundManager` had an unresolvable `@Inject constructor(Context)`). | Re-bind on every owner change; beep first, record after; mode→look state machine; dead DI removed. |
 | 10 | Medium | The whole screen recomposed ~40×/s from the microphone flows. | Audio flows are collected inside their own composables. |
 | 11 | Medium | Four simultaneous use cases (Preview + ImageCapture + VideoCapture + ImageAnalysis) fail on many LIMITED-level devices; no fallback. | Now Preview + ImageCapture + ImageAnalysis (video is encoded from the GPU frame) with automatic retry without analysis. |
@@ -28,6 +28,15 @@
 
 Removed (dead or harmful): `FilterRenderer`, `ImageEnhancementPipeline` (never called), `ComputationalPhotoEngine` (item 3),
 `di/CameraModule`, CameraX `camera-video` / `camera-extensions` dependencies.
+
+### 1b. Bugs found by checking my own new code against the official CameraX docs
+| # | Finding | Fix |
+|---|---------|-----|
+| A | **Viewfinder would have been rotated 90°.** For a Surface backed by a SurfaceTexture, `getTransformMatrix()` already puts the preview in natural orientation; only the display rotation is left to add. My pipeline added the full `rotationDegrees` on top. | `GlMath.plan()`: apply only `rotationDegrees − sensorRotationDegrees` (0 for portrait phones). Unit-tested for back / front / landscape. |
+| B | **Tap-to-focus coordinates were in the wrong space.** CameraX metering points are in the camera buffer's own (landscape) orientation; I passed upright-frame coordinates. | `GlMath.frameToBuffer()` (same maths as CameraX's DisplayOrientedMeteringPointFactory), checked against `np.rot90` for all four rotations and unit-tested. |
+
+Checked and confirmed in the docs: `ImageCapture.Builder.setJpegQuality / setTargetAspectRatio / setCaptureMode`, `CameraInfo.sensorRotationDegrees`,
+`SurfaceOrientedMeteringPointFactory(width, height, useCase)`, `TransformationInfo.rotationDegrees`, MediaMuxer with a read-write descriptor.
 
 ## 2. New: **Pulse** — the camera listens
 
